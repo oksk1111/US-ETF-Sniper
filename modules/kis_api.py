@@ -30,6 +30,16 @@ class KisOverseas:
         
         try:
             res = requests.post(self.url + path, headers=headers, data=json.dumps(body))
+            
+            # Handle Rate Limit (1 request per minute)
+            if res.status_code == 403 and "EGW00133" in res.text:
+                print("[KIS] Token rate limit hit. Waiting 60 seconds...")
+                time.sleep(65)
+                res = requests.post(self.url + path, headers=headers, data=json.dumps(body))
+
+            if res.status_code != 200:
+                print(f"[KIS] Token Refresh Error: {res.status_code} {res.text}")
+            
             res.raise_for_status()
             data = res.json()
             self.access_token = data['access_token']

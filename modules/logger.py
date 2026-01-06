@@ -13,7 +13,7 @@ def setup_logger():
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     
     # File Handler
-    file_handler = logging.FileHandler(f"database/trading_{datetime.now().strftime('%Y%m%d')}.log")
+    file_handler = logging.FileHandler(f"database/trading_{datetime.now().strftime('%Y%m%d')}.log", encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     

@@ -67,6 +67,13 @@ python run_bot.py
 python run_bot.py --test
 ```
 
+### 📊 대시보드 (Web UI)
+봇의 상태와 로그를 웹 브라우저에서 실시간으로 확인할 수 있습니다.
+
+```bash
+streamlit run dashboard.py
+```
+
 ## 📁 프로젝트 구조
 
 ```

@@ -61,7 +61,14 @@ def job():
         logger.error("Failed to get Quote.")
         return
         
-    today_open = float(quote['open'])
+    logger.info(f"Quote Data: {quote}")
+    
+    # Handle potential missing keys or different key names
+    try:
+        today_open = float(quote.get('open', 0))
+    except (ValueError, TypeError):
+        today_open = 0
+        
     if today_open == 0:
         logger.warning("Market not fully open yet (Open=0). Waiting...")
         # In real loop, retry. Here we assume open.
@@ -126,9 +133,18 @@ if __name__ == "__main__":
     # Schedule
     schedule.every().day.at("23:30").do(job)
     
+    # Heartbeat (Every 1 hour) to keep dashboard alive
+    def heartbeat():
+        logger.info("Bot is alive... Waiting for 23:30 KST")
+        
+    schedule.every(1).hours.do(heartbeat)
+    
     # For testing, run immediately if argument provided
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        print("DEBUG: Running in TEST mode")
         job()
+        print("DEBUG: Test job finished")
+        sys.exit(0) # Exit after test
     
     while True:
         schedule.run_pending()
