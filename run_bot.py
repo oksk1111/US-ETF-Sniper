@@ -114,14 +114,14 @@ def job():
     # 2. Watch Loop
     while get_us_market_time():
         for ticker, data in monitoring_targets.items():
+            # If already bought, we might want to check for Stop Loss (Optional Improvement)
             if data['status'] == 'bought':
                 continue
                 
             current_price = kis.get_current_price(ticker)
             target_price = data['target']
             
-            # Debug log occasionally? No, keep it clean.
-            
+            # Simple Breakout Check
             if current_price and current_price >= target_price:
                 logger.info(f"[{ticker}] Breakout Detected! ({current_price} >= {target_price})")
                 
@@ -135,51 +135,16 @@ def job():
                 if sentiment.get('can_buy', False):
                     logger.info(f"[{ticker}] AI Approved. Buying...")
                     res = kis.buy_market_order(ticker, QTY)
-                    if res:
+                    if res and res.get('rt_cd') == '0':
                         data['status'] = 'bought'
                         data['buys'] += 1
+                        logger.info(f"[{ticker}] Buy Success!")
+                    else:
+                        logger.error(f"[{ticker}] Buy Failed: {res}")
                 else:
                     logger.info(f"[{ticker}] AI Rejected buying due to risk.")
-                    # Optional: Add cooldown or skip for day? 
-                    # For now, let it retry loop (price calls) but AI might reject again if news same.
-                    # To prevent api spam, maybe sleep longer or mark as 'rejected'
-                    time.sleep(10) # Small pause
-
-        time.sleep(0.1) # Optimized Polling
-        
-    # 3. Market Close Sell-off
-    logger.info("Market Close. Selling All Holdings.")
-    for ticker, data in monitoring_targets.items():
-        if data['status'] == 'bought':
-            logger.info(f"[{ticker}] Selling Market Order...")
-            kis.sell_market_order(ticker, QTY)
-                if res and res.get('rt_cd') == '0':
-                    logger.info(f"Buy Order Success! {res.get('msg1')}")
-                    bought = True
-                    buy_price = current_price # Approximate
-                else:
-                    logger.error(f"Buy Failed: {res}")
-            else:
-                logger.info(f"AI Rejected: {sentiment.get('reason')}")
-                break # Stop for the day if AI rejects? Or wait? Strategy says "Cancel Order" -> No trade.
-        
-        if bought:
-            # 5. Monitoring (Stop Loss / Trailing Stop)
-            # Simple Stop Loss -3%
-            loss_pct = (current_price - buy_price) / buy_price * 100
-            if loss_pct <= -3.0:
-                logger.warning(f"Stop Loss Triggered! ({loss_pct:.2f}%)")
-                kis.sell_market_order(TARGET_TICKER, QTY)
-                break
-            
-                        data['status'] = 'bought'
-                        data['buys'] += 1
-                else:
-                    logger.info(f"[{ticker}] AI Rejected buying due to risk.")
-                    # Optional: Add cooldown or skip for day? 
-                    # For now, let it retry loop (price calls) but AI might reject again if news same.
-                    # To prevent api spam, maybe sleep longer or mark as 'rejected'
-                    time.sleep(10) # Small pause
+                    # Add cooldown to prevent spamming AI checks for the same ticker
+                    time.sleep(10) 
 
         time.sleep(0.1) # Optimized Polling
         
