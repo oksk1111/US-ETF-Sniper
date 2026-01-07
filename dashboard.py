@@ -15,7 +15,7 @@ st.set_page_config(
 st.title("📈 US-ETF-Sniper Dashboard")
 
 # --- Initialize API ---
-# @st.cache_resource  <-- Disabled caching for debugging
+@st.cache_resource
 def get_kis_client():
     return KisOverseas()
 
