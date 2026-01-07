@@ -1,7 +1,38 @@
 import requests
 import json
 import time
+from collections import deque
 from config import KIS_BASE_URL, KIS_APP_KEY, KIS_APP_SECRET, KIS_CANO, KIS_ACNT_PRDT_CD
+
+class RateLimiter:
+    """
+    Token Bucket / Sliding Window Rate Limiter
+    Ensures we do not exceed 'max_calls' per 'period' seconds.
+    """
+    def __init__(self, max_calls=15, period=1.0):
+        self.max_calls = max_calls
+        self.period = period
+        self.timestamps = deque()
+
+    def wait(self):
+        """Blocks execution if rate limit is hit"""
+        now = time.time()
+        
+        # Remove timestamps older than the period
+        while self.timestamps and now - self.timestamps[0] > self.period:
+            self.timestamps.popleft()
+            
+        if len(self.timestamps) >= self.max_calls:
+            # Calculate wait time
+            wait_time = self.period - (now - self.timestamps[0])
+            if wait_time > 0:
+                time.sleep(wait_time)
+            # Clean up again after sleeping
+            now = time.time()
+            while self.timestamps and now - self.timestamps[0] > self.period:
+                self.timestamps.popleft()
+                
+        self.timestamps.append(time.time())
 
 class KisOverseas:
     def __init__(self):
@@ -12,6 +43,9 @@ class KisOverseas:
         self.acc_no_suffix = KIS_ACNT_PRDT_CD
         self.access_token = None
         self.token_expiry = 0
+        
+        # System-level Rate Limiter (Max 15 req/sec safely under 20 limit)
+        self.limiter = RateLimiter(max_calls=15, period=1.0)
         
         self._refresh_token()
 
@@ -60,26 +94,24 @@ class KisOverseas:
         }
 
     def get_current_price(self, ticker):
-        """해외주식 현재가 조회 (NAS: 나스닥)"""
+        """현재가 조회 (주식현재가 시세)"""
+        # HHHDFS76200200 : 해외주식 현재가 상세 (미국)
+        tr_id = "HDFS76200200" if "openapivts" not in self.url else "HHDFS76200200" 
         path = "/uapi/overseas-price/v1/quotations/price"
-        headers = self._get_headers("HHDFS00000300")
+        
+        headers = self._get_headers(tr_id)
         params = {
             "AUTH": "",
-            "EXCD": "NAS",
+            "EXCD": "NAS", # NAS for Nasdaq. Needs mapping for NYSE/AMEX if needed.
             "SYMB": ticker
         }
         
-        try:
-            res = requests.get(self.url + path, headers=headers, params=params)
-            res.raise_for_status()
-            data = res.json()
-            if data['rt_cd'] != '0':
-                print(f"[KIS] Error getting price: {data['msg1']}")
-                return None
-            return float(data['output']['last'])
-        except Exception as e:
-            print(f"[KIS] Exception getting price: {e}")
-            return None
+        # Use Rate Limited Request
+        res = self._request("GET", path, headers=headers, params=params)
+        
+        if res and res['rt_cd'] == '0':
+            return float(res['output']['last'])
+        return None
 
     def get_quote(self, ticker):
         """해외주식 현재가 상세 조회 (시가, 고가, 저가 포함)"""
@@ -225,8 +257,8 @@ class KisOverseas:
             "ACNT_PRDT_CD": self.acc_no_suffix,
             "OVRS_EXCG_CD": "NAS",
             "TR_CRCY_CD": "USD",
-            "CTX_AREA_FK100": "",
-            "CTX_AREA_NK100": ""
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": ""
         }
         
         try:
@@ -235,4 +267,49 @@ class KisOverseas:
             return res.json()
         except Exception as e:
             print(f"[KIS] Balance check failed: {e}")
+            return None
+
+    def get_foreign_balance(self):
+        """외화예수금 조회 (USD) - CTRP6504R"""
+        # 실전: CTRP6504R / 모의: VTTC8434R
+        tr_id = "VTTC8434R" if "openapivts" in self.url else "CTRP6504R"
+        path = "/uapi/domestic-stock/v1/trading/inquire-balance"
+        
+        headers = self._get_headers(tr_id)
+        
+        params = {
+            "CANO": self.acc_no_prefix,
+            "ACNT_PRDT_CD": self.acc_no_suffix,
+            "WCRC_FRCR_DVSN_CD": "02", # 외화
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+            "INQR_DVSN": "02", # 계좌별
+            "fund_sttl_icld_yn": "N",
+            "fncg_amt_auto_rdpt_yn": "N",
+            "prcs_dvsn": "00",
+            "TR_MKET_CD": "00",
+            "NATN_CD": "840", # USA
+            "INQR_DVSN_CD": "00"
+        }
+        
+        try:
+            res = requests.get(self.url + path, headers=headers, params=params)
+            res.raise_for_status()
+            data = res.json()
+            # print(f"[DEBUG] Foreign Balance Response: {data}")  # Uncomment for deep debug
+            if data['rt_cd'] == '0' and 'output2' in data:
+                # Find USD item
+                for item in data['output2']:
+                    if item['crcy_cd'].strip() == 'USD':
+                        return {
+                            'deposit': float(item['frcr_dncl_amt_2']), # 예수금
+                            'withdraw_possible': float(item['frcr_drwg_psbl_amt_1']) # 출금가능
+                        }
+                # If USD not found, return raw for debugging
+                return {'debug_raw': data['output2'], 'deposit': 0}
+            else:
+                print(f"[KIS] Foreign Balance Error: {data.get('msg1')} (Code: {data.get('msg_cd')})")
+            return None
+        except Exception as e:
+            print(f"[KIS] Foreign Balance check failed: {e}")
             return None
