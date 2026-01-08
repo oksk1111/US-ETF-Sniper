@@ -93,40 +93,75 @@ with tab1:
         last_log = parsed_lines[-1]
         status = get_bot_status(last_log['timestamp'])
         
-        # 2. Key Metrics (Extract from logs)
-        # Look for "Current: X, MA20: Y" and "Target Price: Z"
-        current_price = "N/A"
-        ma20 = "N/A"
-        target_price = "N/A"
-        
-        for line in reversed(parsed_lines):
-            msg = line['message']
-            # "Current: 54.3839, MA20: 54.3137" or "Current: None, MA20: None"
-            # Updated regex to handle 'None' or numbers
-            m1 = re.search(r"Current: ([^,]+), MA20: (.+)", msg)
-            if m1 and current_price == "N/A":
-                current_price = m1.group(1).strip()
-                ma20 = m1.group(2).strip()
-            
-            # "Target Price: 55.12"
-            m2 = re.search(r"Target Price: ([^ ]+)", msg)
-            if m2 and target_price == "N/A":
-                target_price = m2.group(1).strip()
-                
-            if current_price != "N/A" and target_price != "N/A":
-                break
-        
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Bot Status", status)
-        with col2:
-            st.metric("Current Price", f"${current_price}")
-        with col3:
-            st.metric("Target Price", f"${target_price}")
-        with col4:
-            st.metric("20 MA", f"${ma20}")
-        
+        st.metric("Bot Status", status)
         st.markdown(f"Last Update: `{last_log['timestamp']}`")
+        
+        # 2. Key Metrics by Ticker
+        # We will scan lines to find the LATEST info for each ticker
+        ticker_data = {}
+        
+        # Regex patterns
+        # Log format: "[TQQQ] Current: 54.38, MA20: 54.31"
+        # Log format: "[TQQQ] Bull Market! Target Price: 55.12 (Open: 54.0)"
+        
+        for line in parsed_lines:
+            msg = line['message']
+            
+            # Extract Ticker from [TICKER]
+            ticker_match = re.search(r"\[([A-Z]+)\]", msg)
+            if not ticker_match:
+                continue
+            
+            ticker = ticker_match.group(1)
+            if ticker not in ticker_data:
+                ticker_data[ticker] = {"Current": "N/A", "MA20": "N/A", "Target": "N/A", "Trend": "Unknown"}
+            
+            # Parse Current & MA20
+            # [TQQQ] Current: 54.3839, MA20: 54.3137
+            m1 = re.search(r"Current: ([^,]+), MA20: (.+)", msg)
+            if m1:
+                ticker_data[ticker]["Current"] = m1.group(1).strip()
+                ticker_data[ticker]["MA20"] = m1.group(2).strip()
+                # If we see Current/MA20, we don't know trend yet unless explicit
+            
+            # Parse Target Price
+            # [TQQQ] Bull Market! Target Price: 55.12 ...
+            m2 = re.search(r"Target Price: ([^ ]+)", msg)
+            if m2:
+                ticker_data[ticker]["Target"] = m2.group(1).strip()
+                ticker_data[ticker]["Trend"] = "Bull 🐂"
+            
+            # Parse Bear Market
+            if "Bear Market" in msg:
+                ticker_data[ticker]["Trend"] = "Bear 🐻"
+                ticker_data[ticker]["Target"] = "-"
+
+        # Convert to DataFrame for nice display
+        if ticker_data:
+            st.subheader("📡 Market Monitor")
+            data_list = []
+            for t, d in ticker_data.items():
+                data_list.append({
+                    "Ticker": t,
+                    "Price": d["Current"],
+                    "Target Price": d["Target"],
+                    "20 MA": d["MA20"],
+                    "Trend": d["Trend"]
+                })
+            
+            df_monitor = pd.DataFrame(data_list)
+            st.dataframe(
+                df_monitor, 
+                column_config={
+                    "Ticker": st.column_config.TextColumn("Ticker", width="small"),
+                    "Trend": st.column_config.TextColumn("Trend", width="small"),
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+        else:
+            st.info("Waiting for ticker analysis logs...")
+
     else:
         st.warning("No logs found. Is the bot running?")
 

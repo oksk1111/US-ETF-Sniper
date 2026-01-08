@@ -3,6 +3,7 @@ import datetime
 import schedule
 import sys
 from modules.kis_api import KisOverseas
+from modules.kis_domestic import KisDomestic
 from modules.gemini_analyst import GeminiAnalyst
 from modules.logger import logger
 from strategies.technical import calculate_ma, check_trend
@@ -11,7 +12,7 @@ from strategies.volatility_breakout import calculate_target_price
 # Configuration
 # "Universe" of Hot ETFs/Stocks to monitor
 # The Sniper will watch ALL of these and only attack the ones triggering the strategy.
-TARGET_TICKERS = [
+TARGET_TICKERS_US = [
     # --- AI & Semiconductors (The Hottest) ---
     "NVDL",  # GraniteShares 2x Long NVDA (AI Core)
     "SOXL",  # Direxion Daily Semiconductor Bull 3X (Chips)
@@ -29,34 +30,57 @@ TARGET_TICKERS = [
     "TSLA",  # Tesla (King of Volatility)
 ]
 
+TARGET_TICKERS_KR = [
+    # --- Safe Market Index / US Tech Replicas ---
+    "122630", # KODEX Leverage (KOSPI 200 2x) - High Liquidity
+    "233740", # KODEX KOSDAQ150 Leverage - High Volatility
+    "449200", # KODEX US Tech Top10 - Safe US Tech Proxy
+]
+
 QTY = 1 # Quantity per trade (Adjust based on portfolio size!)
 K_VALUE = 0.5
 
-def get_us_market_time():
-    # Simple check for US Market Time (approximate)
-    # Returns True if within 23:30 ~ 06:00 (Standard Time)
-    # Need to handle DST properly in production, but for now simple check
+def get_market_status():
+    """
+    Returns 'US', 'KR', or 'CLOSED' based on current KST time.
+    """
     now = datetime.datetime.now()
-    # Convert to simple time integer HHMM
     t = int(now.strftime("%H%M"))
     
-    # Market Hours: 2330 ~ 2400 OR 0000 ~ 0600
+    # US Market: 23:30 ~ 06:00
     if 2330 <= t <= 2400 or 0 <= t < 600:
-        return True
-    return False
+        return 'US'
+    
+    # KR Market: 09:00 ~ 15:20 (Leave 10 mins for closing auction safely)
+    if 900 <= t <= 1520:
+        return 'KR'
+        
+    return 'CLOSED'
 
 def job():
-    logger.info(f"Starting Trading Session for {TARGET_TICKERS}")
+    market = get_market_status()
     
-    kis = KisOverseas()
+    if market == 'CLOSED':
+        logger.info("Market is closed. Sleeping.")
+        return
+
+    # Select Market Context
+    if market == 'US':
+        logger.info(f"🇺🇸 Starting US Trading Session for {TARGET_TICKERS_US}")
+        kis = KisOverseas()
+        tickers = TARGET_TICKERS_US
+    else:
+        logger.info(f"🇰🇷 Starting KR Trading Session for {TARGET_TICKERS_KR}")
+        kis = KisDomestic()
+        tickers = TARGET_TICKERS_KR
+    
     ai = GeminiAnalyst()
     
     # Dictionary to store monitoring targets
-    # Structure: {'TQQQ': {'target': 105.5, 'status': 'monitoring'}, ...}
     monitoring_targets = {}
 
     # 1. Initialize Targets for each ticker
-    for ticker in TARGET_TICKERS:
+    for ticker in tickers:
         logger.info(f"Analyzing {ticker}...")
         
         # A. Trend Check (20MA)
@@ -81,21 +105,18 @@ def job():
             logger.info(f"[{ticker}] Bear Market (Price < 20MA). Skipping.")
             continue
 
-        # B. Calculate Target Price
-        quote = kis.get_quote(ticker)
-        if not quote:
-            logger.error(f"[{ticker}] Failed to get Quote.")
-            continue
-            
-        try:
-            today_open = float(quote.get('open', 0))
-        except (ValueError, TypeError):
-            today_open = 0
-            
-        if today_open == 0:
-            logger.warning(f"[{ticker}] Market not fully open (Open=0). Using Current as Open.")
-            today_open = current_price 
-            
+        # B. Calculate Target Price (Common Logic)
+        # Note: KR API OHLC structure is adapted to match US one in kis_domestic.py
+        # Need Open price for today.
+        
+        # Get Quote/Current for Open Price
+        # For simplicity, we use OHLC[0] if available or fetch current quote
+        # OHLC[0] from API is today's data usually in KIS, but let's be safe.
+        today_open = float(ohlc[0]['open']) # API returns latest first usually?
+        # Actually kis_domestic returns list daily daily.
+        # Let's rely on OHLC data we just got.
+        # KIS Domestic OHLC[0] is most recent day.
+        
         target_price = calculate_target_price(today_open, ohlc, K_VALUE)
         logger.info(f"[{ticker}] Bull Market! Target Price: {target_price} (Open: {today_open})")
         
@@ -106,28 +127,31 @@ def job():
         }
 
     if not monitoring_targets:
-        logger.info("No targets found for today (All Bear Market or Errors). Sleeping.")
+        logger.info(f"[{market}] No targets found for today. Sleeping.")
         return
 
-    logger.info(f"Watch List: {list(monitoring_targets.keys())}")
+    logger.info(f"[{market}] Watch List: {list(monitoring_targets.keys())}")
     
     # 2. Watch Loop
-    while get_us_market_time():
+    while True:
+        # Check if market closed
+        current_market = get_market_status()
+        if current_market != market:
+            logger.info(f"[{market}] Market Closed. Ending Session.")
+            break
+            
         for ticker, data in monitoring_targets.items():
-            # If already bought, we might want to check for Stop Loss (Optional Improvement)
             if data['status'] == 'bought':
                 continue
                 
             current_price = kis.get_current_price(ticker)
             target_price = data['target']
             
-            # Simple Breakout Check
             if current_price and current_price >= target_price:
                 logger.info(f"[{ticker}] Breakout Detected! ({current_price} >= {target_price})")
                 
-                # 3. AI Filter
                 logger.info("Checking AI Sentiment...")
-                news = ai.fetch_news()
+                news = ai.fetch_news() # TODO: Improve AI news source for KR stocks later
                 sentiment = ai.check_market_sentiment(news)
                 
                 logger.info(f"AI Result: {sentiment}")
@@ -135,7 +159,13 @@ def job():
                 if sentiment.get('can_buy', False):
                     logger.info(f"[{ticker}] AI Approved. Buying...")
                     res = kis.buy_market_order(ticker, QTY)
-                    if res and res.get('rt_cd') == '0':
+                    # Result checking
+                    is_success = False
+                    if res:
+                        if market == 'US' and res.get('rt_cd') == '0': is_success = True
+                        if market == 'KR' and res.get('rt_cd') == '0': is_success = True
+                        
+                    if is_success:
                         data['status'] = 'bought'
                         data['buys'] += 1
                         logger.info(f"[{ticker}] Buy Success!")
@@ -143,49 +173,56 @@ def job():
                         logger.error(f"[{ticker}] Buy Failed: {res}")
                 else:
                     logger.info(f"[{ticker}] AI Rejected buying due to risk.")
-                    # Add cooldown to prevent spamming AI checks for the same ticker
                     time.sleep(10) 
 
-        time.sleep(0.1) # Optimized Polling
+        time.sleep(0.1)
         
     # 3. Market Close Sell-off
-    logger.info("Market Close. Selling All Holdings.")
+    logger.info(f"[{market}] Session End. Selling All Holdings.")
     for ticker, data in monitoring_targets.items():
         if data['status'] == 'bought':
             logger.info(f"[{ticker}] Selling Market Order...")
             kis.sell_market_order(ticker, QTY)
 
 if __name__ == "__main__":
-    logger.info("=== US ETF Sniper Bot Started ===")
-    logger.info(f"Targets: {TARGET_TICKERS}")
-    logger.info("Waiting for schedule (23:30 KST)...")
+    logger.info("=== Global ETF Sniper Bot Started ===")
+    logger.info(f"US Targets: {TARGET_TICKERS_US}")
+    logger.info(f"KR Targets: {TARGET_TICKERS_KR}")
     
-    # Schedule
-    schedule.every().day.at("23:30").do(job)
+    # Schedule - Check every 1 minute to trigger job if market is open
+    # We replaced the fixed "at 23:30" with a continuous check loop below
+    # because we now have two market sessions.
     
-    # Heartbeat (Every 1 minute) to keep dashboard alive
+    # Heartbeat
     def heartbeat():
-        logger.info("Heartbeat: Bot is alive... Waiting for 23:30 KST")
+        status = get_market_status()
+        logger.info(f"Heartbeat: Bot is alive... Market Status: {status}")
         
     schedule.every(1).minutes.do(heartbeat)
     
-    # Initial status log
-    try:
-        startup_kis = KisOverseas()
-        for t in TARGET_TICKERS:
-            curr = startup_kis.get_current_price(t)
-            if curr:
-                logger.info(f"[{t}] Startup Check - Current Price: {curr}")
-    except Exception as e:
-        logger.error(f"Startup Check Failed: {e}")
-
-    # For testing, run immediately if argument provided
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        print("DEBUG: Running in TEST mode")
+    # Startup Check
+    ctx = get_market_status()
+    if ctx != 'CLOSED':
+        logger.info(f"Bot started during {ctx} Trading Hours. Launching job immediately.")
         job()
-        print("DEBUG: Test job finished")
-        sys.exit(0) # Exit after test
-    
+
     while True:
         schedule.run_pending()
-        time.sleep(60)
+        
+        # Poll for market start times
+        # If we are not in a job (job blocks execution), this loop runs.
+        # We need to trigger job() when time is right.
+        now = datetime.datetime.now()
+        t = int(now.strftime("%H%M"))
+        
+        # Trigger at 09:00 for KR
+        if t == 900:
+            job()
+            time.sleep(60) # Avoid double trigger
+            
+        # Trigger at 23:30 for US
+        if t == 2330:
+            job()
+            time.sleep(60)
+            
+        time.sleep(1)

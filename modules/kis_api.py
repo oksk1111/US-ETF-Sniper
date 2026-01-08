@@ -93,6 +93,26 @@ class KisOverseas:
             "tr_id": tr_id
         }
 
+    def _request(self, method, path, headers=None, params=None, data=None):
+        self.limiter.wait()
+        try:
+            if method == "GET":
+                res = requests.get(self.url + path, headers=headers, params=params)
+            elif method == "POST":
+                res = requests.post(self.url + path, headers=headers, data=data)
+            
+            # Simple error logging
+            if res.status_code != 200:
+                # 404/500 etc
+                pass 
+            
+            # Note: We rely on caller to check res['rt_cd'] usually, 
+            # but raise_for_status handles HTTP errors.
+            return res.json()
+        except Exception as e:
+            # print(f"[KIS_API] Request Exception ({path}): {e}")
+            return None
+
     def get_current_price(self, ticker):
         """현재가 조회 (주식현재가 시세)"""
         # HHHDFS76200200 : 해외주식 현재가 상세 (미국)

@@ -1,0 +1,177 @@
+import requests
+import json
+import time
+from config import KIS_BASE_URL, KIS_APP_KEY, KIS_APP_SECRET, KIS_CANO, KIS_ACNT_PRDT_CD
+from modules.kis_api import RateLimiter
+
+class KisDomestic:
+    def __init__(self):
+        self.url = KIS_BASE_URL
+        self.app_key = KIS_APP_KEY
+        self.app_secret = KIS_APP_SECRET
+        self.acc_no_prefix = KIS_CANO
+        self.acc_no_suffix = KIS_ACNT_PRDT_CD
+        self.access_token = None
+        self.token_expiry = 0
+        
+        # Share rate limiter concept or create new one
+        self.limiter = RateLimiter(max_calls=15, period=1.0)
+        
+        self._refresh_token()
+
+    def _refresh_token(self):
+        """Access Token 발급 (동일 로직)"""
+        if time.time() < self.token_expiry:
+            return
+
+        path = "/oauth2/tokenP"
+        headers = {"content-type": "application/json"}
+        body = {
+            "grant_type": "client_credentials",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret
+        }
+        
+        try:
+            res = requests.post(self.url + path, headers=headers, data=json.dumps(body))
+            
+            if res.status_code == 403 and "EGW00133" in res.text:
+                print("[KIS-KR] Token rate limit hit. Waiting 60 seconds...")
+                time.sleep(65)
+                res = requests.post(self.url + path, headers=headers, data=json.dumps(body))
+
+            if res.status_code != 200:
+                print(f"[KIS-KR] Token Refresh Error: {res.status_code} {res.text}")
+            
+            res.raise_for_status()
+            data = res.json()
+            self.access_token = data['access_token']
+            self.token_expiry = time.time() + int(data['expires_in']) - 60
+            print(f"[KIS-KR] Token refreshed.")
+        except Exception as e:
+            print(f"[KIS-KR] Token refresh failed: {e}")
+            raise
+
+    def _get_headers(self, tr_id):
+        self._refresh_token()
+        return {
+            "content-type": "application/json",
+            "authorization": f"Bearer {self.access_token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": tr_id,
+            "custtype": "P" # 개인
+        }
+
+    def _request(self, method, path, headers=None, params=None, data=None):
+        self.limiter.wait()
+        try:
+            if method == "GET":
+                res = requests.get(self.url + path, headers=headers, params=params)
+            elif method == "POST":
+                res = requests.post(self.url + path, headers=headers, data=data)
+            return res.json()
+        except Exception as e:
+            print(f"[KIS-KR] Request Exception: {e}")
+            return None
+
+    def get_current_price(self, ticker):
+        """국내주식 현재가 조회 - FHKST01010100"""
+        path = "/uapi/domestic-stock/v1/quotations/inquire-price"
+        headers = self._get_headers("FHKST01010100")
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J", # 주식, ETF, ETN
+            "FID_INPUT_ISCD": ticker
+        }
+        
+        res = self._request("GET", path, headers=headers, params=params)
+        if res and res['rt_cd'] == '0':
+            return float(res['output']['stck_prpr']) # 현재가
+        return None
+
+    def get_daily_ohlc(self, ticker):
+        """국내주식 기간별 시세 (일봉) - FHKST01010400"""
+        path = "/uapi/domestic-stock/v1/quotations/inquire-daily-price"
+        headers = self._get_headers("FHKST01010400")
+        
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": ticker,
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "1" # 수정주가 반영
+        }
+        
+        res = self._request("GET", path, headers=headers, params=params)
+        if res and res['rt_cd'] == '0':
+            # Format to match strategies expectations: [{'clos': '100', ...}]
+            # API returns stck_clpr (close), stck_oprc (open), etc.
+            output_list = []
+            for item in res['output']:
+                output_list.append({
+                    'clos': item['stck_clpr'],
+                    'open': item['stck_oprc'],
+                    'high': item['stck_hgpr'],
+                    'low': item['stck_lwpr']
+                })
+            return output_list
+        return None
+
+    def get_balance(self):
+        """주식 잔고 조회 - TTTC8434R (실전/모의 구분 필요)"""
+        # 실전: TTTC8434R, 모의: VTTC8434R
+        tr_id = "VTTC8434R" if "openapivts" in self.url else "TTTC8434R"
+        path = "/uapi/domestic-stock/v1/trading/inquire-balance"
+        headers = self._get_headers(tr_id)
+        
+        params = {
+            "CANO": self.acc_no_prefix,
+            "ACNT_PRDT_CD": self.acc_no_suffix,
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "N",
+            "INQR_DVSN": "02",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "00",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": ""
+        }
+        
+        res = self._request("GET", path, headers=headers, params=params)
+        return res
+
+    def buy_market_order(self, ticker, qty):
+        """국내주식 시장가 매수"""
+        # 실전: TTTC0802U / 모의: VTTC0802U
+        tr_id = "VTTC0802U" if "openapivts" in self.url else "TTTC0802U"
+        path = "/uapi/domestic-stock/v1/trading/order-cash"
+        headers = self._get_headers(tr_id)
+        
+        data = {
+            "CANO": self.acc_no_prefix,
+            "ACNT_PRDT_CD": self.acc_no_suffix,
+            "PDNO": ticker,
+            "ORD_DVSN": "01", # 01: 시장가
+            "ORD_QTY": str(qty),
+            "ORD_UNPR": "0" # 시장가는 0
+        }
+        
+        return self._request("POST", path, headers=headers, data=json.dumps(data))
+
+    def sell_market_order(self, ticker, qty):
+        """국내주식 시장가 매도"""
+        # 실전: TTTC0801U / 모의: VTTC0801U
+        tr_id = "VTTC0801U" if "openapivts" in self.url else "TTTC0801U"
+        path = "/uapi/domestic-stock/v1/trading/order-cash"
+        headers = self._get_headers(tr_id)
+        
+        data = {
+            "CANO": self.acc_no_prefix,
+            "ACNT_PRDT_CD": self.acc_no_suffix,
+            "PDNO": ticker,
+            "ORD_DVSN": "01", # 01: 시장가
+            "ORD_QTY": str(qty),
+            "ORD_UNPR": "0"
+        }
+        
+        return self._request("POST", path, headers=headers, data=json.dumps(data))
