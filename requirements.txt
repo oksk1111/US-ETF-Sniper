@@ -13,3 +13,5 @@ groq
 streamlit
 openai
 websockets
+PyJWT
+python-multipart

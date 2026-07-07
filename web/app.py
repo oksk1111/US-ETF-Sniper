@@ -14,7 +14,7 @@ import pytz
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Depends
+from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -30,8 +30,11 @@ print(f"[Dashboard] Starting... BASE_DIR={BASE_DIR}")
 
 # Authentication
 from web.auth import (
-    require_auth, is_authenticated, set_auth_cookie,
+    require_auth, is_authenticated, set_auth_cookie, set_session_cookie,
+    clear_session_cookie,
     API_KEY, AUTH_COOKIE_NAME, verify_key, _extract_key_from_request,
+    GOOGLE_CLIENT_ID, get_google_auth_url, exchange_code_for_user,
+    is_email_allowed, create_session_token, verify_password,
 )
 
 # FastAPI 앱 초기화
@@ -40,6 +43,94 @@ app = FastAPI(title="Alpha Trader Dashboard")
 # 템플릿 설정
 templates = Jinja2Templates(directory=str(BASE_DIR / "web" / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "web" / "static")), name="static")
+
+
+# --- 302 Redirect Exception Handler ---
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    """Handle 302 redirects from require_auth gracefully."""
+    if exc.status_code == 302 and exc.headers and "Location" in exc.headers:
+        return RedirectResponse(url=exc.headers["Location"])
+    # Default behavior for other HTTP exceptions
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
+
+# --- OAuth Routes ---
+@app.get("/login")
+async def login_page(request: Request, error: str = ""):
+    """로그인 페이지"""
+    google_enabled = bool(GOOGLE_CLIENT_ID)
+    google_auth_url = get_google_auth_url() if google_enabled else ""
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "google_enabled": google_enabled,
+        "google_auth_url": google_auth_url,
+        "error": error,
+    })
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    """비밀번호 로그인 처리"""
+    form = await request.form()
+    password = form.get("password", "")
+
+    if verify_password(password):
+        # 비밀번호 로그인 성공 → JWT 세션 발급
+        token = create_session_token("oksk1111@gmail.com", "Operator")
+        response = RedirectResponse(url="/", status_code=302)
+        set_session_cookie(response, token)
+        print(f"[Auth] Password login success from {request.client.host}")
+        return response
+
+    # 실패
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "google_enabled": bool(GOOGLE_CLIENT_ID),
+        "google_auth_url": get_google_auth_url() if GOOGLE_CLIENT_ID else "",
+        "error": "비밀번호가 올바르지 않습니다.",
+    })
+
+
+@app.get("/auth/callback")
+async def auth_callback(request: Request, code: str = "", error: str = ""):
+    """Google OAuth 콜백 처리"""
+    if error:
+        return RedirectResponse(url=f"/login?error=Google 인증이 취소되었습니다.")
+
+    if not code:
+        return RedirectResponse(url="/login?error=인증 코드가 없습니다.")
+
+    # Exchange code for user info
+    user_info = exchange_code_for_user(code)
+    if not user_info:
+        return RedirectResponse(url="/login?error=Google 인증에 실패했습니다. 다시 시도해주세요.")
+
+    email = user_info.get("email", "")
+    name = user_info.get("name", "")
+
+    # Check email whitelist
+    if not is_email_allowed(email):
+        print(f"[Auth] Blocked login attempt from: {email}")
+        return RedirectResponse(url=f"/login?error=허용되지 않은 이메일입니다: {email}")
+
+    # Create session and set cookie
+    token = create_session_token(email, name)
+    response = RedirectResponse(url="/", status_code=302)
+    set_session_cookie(response, token)
+    print(f"[Auth] Google login success: {email} ({name})")
+    return response
+
+
+@app.get("/logout")
+async def logout(request: Request):
+    """로그아웃 — 세션 쿠키 삭제"""
+    response = RedirectResponse(url="/login", status_code=302)
+    clear_session_cookie(response)
+    return response
 
 # --- Config 관리 ---
 CONFIG_FILE = BASE_DIR / "user_config.json"
