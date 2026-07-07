@@ -22,6 +22,9 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 
+# Dashboard Authentication
+DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY")
+
 # Base URLs
 KIS_URL_REAL = "https://openapi.koreainvestment.com:9443"
 KIS_URL_MOCK = "https://openapivts.koreainvestment.com:29443"

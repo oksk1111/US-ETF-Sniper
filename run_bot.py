@@ -18,7 +18,11 @@ from strategies.technical import (
 )
 from strategies.volatility_breakout import calculate_target_price
 from modules.account_manager import update_all_accounts
-from modules.market_scanner import scanner  # New scanner module
+try:
+    from modules.market_scanner import scanner  # New scanner module
+except Exception as _scanner_err:
+    scanner = None
+    print(f"[WARN] market_scanner import failed (bot will run without scanner): {_scanner_err}")
 from modules.multi_llm import MultiLLMAnalyst
 from modules.auto_strategy import AutoStrategyOptimizer
 from modules import trade_journal
@@ -2537,6 +2541,8 @@ if __name__ == "__main__":
             
     def run_scanner():
         """Run Market Scanner for KR Stocks"""
+        if scanner is None:
+            return
         status = get_market_status()
         if status == 'KR': # Only scan during KR market hours
             try:

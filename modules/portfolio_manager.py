@@ -69,30 +69,9 @@ ETF_CANDIDATES = {
         "483340": ("ACE 구글밸류체인액티브", "ETF_SAT"),
         "0041D0": ("KODEX 미국AI소프트웨어TOP10", "ETF_SAT"),
     },
-    # 한국 우량 개별주 (코어 ETF의 기회손실 보완 - LG/현대/금융/바이오 등)
-    # 저비중(STOCK weight) 적용 + 일일 모멘텀 재평가로 자동 편입/삭제
-    "KR_STOCK_LARGECAP": {
-        "005930": ("삼성전자", "STOCK"),
-        "000660": ("SK하이닉스", "STOCK"),
-        "005380": ("현대차", "STOCK"),
-        "000270": ("기아", "STOCK"),
-        "035420": ("NAVER", "STOCK"),
-        "035720": ("카카오", "STOCK"),
-        "066570": ("LG전자", "STOCK"),
-        "051910": ("LG화학", "STOCK"),
-        "003550": ("LG", "STOCK"),
-        "373220": ("LG에너지솔루션", "STOCK"),
-        "207940": ("삼성바이오로직스", "STOCK"),
-        "028260": ("삼성물산", "STOCK"),
-        "005490": ("POSCO홀딩스", "STOCK"),
-        "012450": ("한화에어로스페이스", "STOCK"),
-        "105560": ("KB금융", "STOCK"),
-        "055550": ("신한지주", "STOCK"),
-        "086790": ("하나금융지주", "STOCK"),
-        "068270": ("셀트리온", "STOCK"),
-        "096770": ("SK이노베이션", "STOCK"),
-        "034730": ("SK", "STOCK"),
-    },
+    # 한국 우량 개별주 — 비활성화 (개별주 변동성 리스크 > ETF 분산 이익)
+    # 2026-07-07: 개별주 편입 중단. ETF만으로 포트폴리오 구성.
+    "KR_STOCK_LARGECAP": {},
     # 달러 기반 해외 ETF 후보 (미국 직접 투자)
     "US_DIRECT": {
         "SOXL": ("SOXL (Semiconductor 3X)", "ETF_LEV"),
@@ -103,24 +82,8 @@ ETF_CANDIDATES = {
         "SMH": ("SMH (Semiconductor 1X)", "ETF"),
         "SPY": ("SPY (S&P500 1X)", "ETF"),
     },
-    # 미국 우량 개별주 (대형 테크/금융/필수소비) - 저비중 STOCK
-    "US_STOCK_LARGECAP": {
-        "AAPL": ("Apple", "STOCK"),
-        "MSFT": ("Microsoft", "STOCK"),
-        "GOOGL": ("Alphabet", "STOCK"),
-        "AMZN": ("Amazon", "STOCK"),
-        "META": ("Meta", "STOCK"),
-        "NVDA": ("NVIDIA", "STOCK"),
-        "AVGO": ("Broadcom", "STOCK"),
-        "AMD": ("AMD", "STOCK"),
-        "TSLA": ("Tesla", "STOCK"),
-        "NFLX": ("Netflix", "STOCK"),
-        "COST": ("Costco", "STOCK"),
-        "LLY": ("Eli Lilly", "STOCK"),
-        "JPM": ("JPMorgan", "STOCK"),
-        "V": ("Visa", "STOCK"),
-        "TSM": ("TSMC ADR", "STOCK"),
-    },
+    # 미국 우량 개별주 — 비활성화 (ETF만 운용)
+    "US_STOCK_LARGECAP": {},
 }
 
 # US 종목 거래소 매핑 (NAS=NASDAQ, AMS=NYSE/AMEX 통합 KIS 코드)

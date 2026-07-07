@@ -19,5 +19,9 @@ Environment="TZ=Asia/Seoul"
 Environment="TELEGRAM_BOT_TOKEN=your_bot_token_here"
 Environment="TELEGRAM_CHAT_ID=your_chat_id_here"
 
+# Dashboard Authentication (Replace with a strong random key)
+# Generate one with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+Environment="DASHBOARD_API_KEY=CHANGE_ME_TO_A_RANDOM_KEY"
+
 [Install]
 WantedBy=multi-user.target

@@ -131,4 +131,8 @@ class MarketScanner:
         candidates.sort(key=lambda x: x['rate'], reverse=True)
         return candidates[:5]
 
-scanner = MarketScanner()
+try:
+    scanner = MarketScanner()
+except Exception as _e:
+    scanner = None
+    logger.warning(f"MarketScanner initialization failed (will retry on demand): {_e}")

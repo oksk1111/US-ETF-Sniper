@@ -28,6 +28,7 @@
 | AI Consensus Policy | 설정 기반 합의 | 쿼럼/매수비율/CRASH veto/동률처리를 설정으로 제어 |
 | Auto Strategy | 자동 전략 전환 | 시장/자산/포지션 상태 기반 전략/모드/페르소나 자동 최적화 |
 | Dashboard | 운영 관제 | 총자산, 수익률, 보유종목, 최근 주문/로그를 웹에서 확인 |
+| Dashboard Auth | 접근 통제 | API 키 기반 인증 + Rate Limiting + 쿠키 세션 (v3.1) |
 | Notifications | 알림 전송 | Telegram 연동으로 중요 이벤트 전달 |
 
 ## 🧱 Tech Stack
@@ -60,6 +61,7 @@ KIS_PRODUCT_CODE=...
 GEMINI_API_KEY=...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
+DASHBOARD_API_KEY=...   # 대시보드 접근 키 (미설정 시 랜덤 생성)
 ```
 
 ### 3. 사용자 설정 확인

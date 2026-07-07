@@ -14,8 +14,8 @@ import pytz
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request, Depends
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import time as _time
@@ -27,6 +27,12 @@ if str(BASE_DIR) not in sys.path:
 os.chdir(BASE_DIR)
 
 print(f"[Dashboard] Starting... BASE_DIR={BASE_DIR}")
+
+# Authentication
+from web.auth import (
+    require_auth, is_authenticated, set_auth_cookie,
+    API_KEY, AUTH_COOKIE_NAME, verify_key, _extract_key_from_request,
+)
 
 # FastAPI 앱 초기화
 app = FastAPI(title="Alpha Trader Dashboard")
@@ -934,32 +940,48 @@ def get_kr_account_data(force_update=False):
 # --- API 엔드포인트 ---
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    """메인 대시보드 페이지"""
-    return render_dashboard_response(request, "overview")
+    """메인 대시보드 페이지 (인증 필요)"""
+    require_auth(request)
+    response = render_dashboard_response(request, "overview")
+    # Set cookie so browser doesn't need ?key= on every page load
+    provided_key = _extract_key_from_request(request)
+    if provided_key and verify_key(provided_key):
+        set_auth_cookie(response, provided_key)
+    return response
 
 @app.get("/api/status")
-async def api_status():
-    """봇 상태 API"""
+async def api_status(request: Request):
+    """봇 상태 API (헬스체크용: 인증 없이 기본 상태만 반환, 인증 시 전체 데이터)"""
     bot_pid = get_bot_pid()
     market_status = get_market_status()
+
+    # Unauthenticated: minimal health-check response (no sensitive data)
+    if not is_authenticated(request):
+        return JSONResponse({
+            "bot_status": "running" if bot_pid else "stopped",
+            "market_status": market_status,
+            "healthy": True,
+        })
+
+    # Authenticated: full status response
     log_file = get_latest_log_file()
     parsed_lines = []
     last_update = "N/A"
-    
+
     if log_file:
         try:
             with open(log_file, "r", encoding="utf-8") as f:
                 lines = f.readlines()[-200:]
         except:
             lines = []
-            
+
         parsed_lines = [parse_log_line(line) for line in lines]
         parsed_lines = [x for x in parsed_lines if x is not None]
         if parsed_lines:
             last_update = parsed_lines[-1]['timestamp']
-            
+
     ticker_data = parse_ticker_data(parsed_lines)
-    
+
     return JSONResponse({
         "bot_pid": bot_pid,
         "bot_status": "🟢 Running" if bot_pid else "🔴 Stopped",
@@ -971,20 +993,24 @@ async def api_status():
     })
 
 @app.get("/api/account")
-async def api_account(force: bool = False):
+async def api_account(request: Request, force: bool = False):
+    require_auth(request)
     data = get_account_data(force)
     return JSONResponse(data)
 
 @app.get("/api/account/kr")
-async def api_account_kr(force: bool = False):
+async def api_account_kr(request: Request, force: bool = False):
+    require_auth(request)
     return JSONResponse(get_kr_account_data(force))
 
 @app.get("/api/dashboard-data")
-async def api_dashboard_data(force: bool = False):
+async def api_dashboard_data(request: Request, force: bool = False):
+    require_auth(request)
     return JSONResponse(build_dashboard_payload(force))
 
 @app.post("/api/config")
 async def update_config(request: Request):
+    require_auth(request)
     data = await request.json()
     config = load_config()
     if "auto_strategy" in data:
@@ -1001,8 +1027,9 @@ async def update_config(request: Request):
     return JSONResponse({"success": True, "config": config})
 
 @app.get("/api/strategy-history")
-async def api_strategy_history():
+async def api_strategy_history(request: Request):
     """전략 변경 히스토리 API"""
+    require_auth(request)
     try:
         if STRATEGY_HISTORY_FILE.exists():
             with open(STRATEGY_HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -1015,8 +1042,9 @@ async def api_strategy_history():
     return JSONResponse({"changes": []})
 
 @app.get("/api/profit-summary")
-async def api_profit_summary():
+async def api_profit_summary(request: Request):
     """수익 요약 API"""
+    require_auth(request)
     result = {"profit_history": {}, "asset_snapshots": {}}
     try:
         if PROFIT_HISTORY_FILE.exists():
@@ -1034,11 +1062,12 @@ async def api_profit_summary():
 
 
 @app.get("/api/measurement")
-async def api_measurement(limit: int = 20):
+async def api_measurement(request: Request, limit: int = 20):
     """Trade Journal 기반 측정 metric (Phase 0).
 
     overall / by_trigger / by_ticker / by_market / by_version 및 최근 N건 거래 반환.
     """
+    require_auth(request)
     try:
         from modules.measurement import build_metrics, format_brief
     except Exception as e:
@@ -1054,8 +1083,9 @@ async def api_measurement(limit: int = 20):
 
 
 @app.get("/api/walk-forward/latest")
-async def api_walk_forward_latest():
+async def api_walk_forward_latest(request: Request):
     """최근 walk-forward 리포트 1건 반환 (없으면 빈 응답)."""
+    require_auth(request)
     try:
         report_dir = BASE_DIR / "database" / "walk_forward_reports"
         if not report_dir.exists():
@@ -1073,7 +1103,8 @@ async def api_walk_forward_latest():
 
 
 @app.post("/api/restart")
-async def restart_bot():
+async def restart_bot(request: Request):
+    require_auth(request)
     old_pid = get_bot_pid()
     if old_pid:
         try:
@@ -1096,7 +1127,12 @@ async def restart_bot():
 async def dashboard_view(request: Request, view_path: str):
     if view_path.startswith("api/") or view_path == "api":
         return JSONResponse({"detail": "Not found"}, status_code=404)
-    return render_dashboard_response(request, resolve_initial_view(view_path))
+    require_auth(request)
+    response = render_dashboard_response(request, resolve_initial_view(view_path))
+    provided_key = _extract_key_from_request(request)
+    if provided_key and verify_key(provided_key):
+        set_auth_cookie(response, provided_key)
+    return response
 
 if __name__ == "__main__":
     import uvicorn
