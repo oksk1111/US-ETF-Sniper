@@ -52,9 +52,9 @@ CONSECUTIVE_DECLINE_DAYS = 2   # 연속 하락 확인 일수
 CONSECUTIVE_DECLINE_PCT = 3.0  # 연속 하락 누적 기준 (%)
 PORTFOLIO_DRAWDOWN_PCT = 5.0   # 포트폴리오 전체 드로다운 차단 기준 (%)
 DCA_MONITOR_INTERVAL = 60      # DCA 감시 루프 주기 (초)
-DCA_REENTRY_INTERVAL_MIN = 15  # DCA 재평가 주기 (분)
-DCA_LEVERAGED_REENTRY_INTERVAL_MIN = 30  # 레버리지 ETF 전용 DCA 재평가 주기 (분)
-DCA_MAX_BUYS_PER_SESSION = 3   # 종목당 세션 최대 DCA 매수 횟수
+DCA_REENTRY_INTERVAL_MIN = 60  # DCA 재평가 주기 (분)
+DCA_LEVERAGED_REENTRY_INTERVAL_MIN = 60  # 레버리지 ETF 전용 DCA 재평가 주기 (분)
+DCA_MAX_BUYS_PER_SESSION = 10  # 종목당 세션 최대 DCA 매수 횟수
 AI_RETRY_COOLDOWN_SEC = 300    # AI 거부 후 재평가 쿨다운 (초)
 TREND_REENTRY_COOLDOWN_SEC = 180  # 추세 이탈 매도 후 재진입 재평가 주기 (초)
 
@@ -94,8 +94,9 @@ CORRELATION_GROUPS = [
     {"005930", "000660"},  # 삼성전자 · SK하이닉스 (반도체 상관도 고움)
 ]
 
-# (3) Losing Streak Throttle — 당일 손절/손실 누적 시 자동 신규 매수 일시정지 [DISABLED 2026-06-17]
-# ⚠️ 6월 1일 이후 손절 누적으로 매수 완전 차단됨 → 일단 비활성화 후 재점검 필요
+# (3) Losing Streak Throttle — 완전 비활성화 [v4.0 공격적 DCA]
+# 손절 누적으로 매수 차단하면 DCA 기회를 영구 상실 → 비활성화.
+# 손절 자체는 유지하되, 손절 이후 매수를 막지 않음.
 LOSING_STREAK_ENABLED = False
 LOSING_STREAK_MAX_STOPS = 3             # 일일 손절/트레일링 손실 누적 건수
 LOSING_STREAK_DAILY_PNL_PCT = -3.0      # 일일 실현 PnL이 이 % 이하면 구매 중단
@@ -200,7 +201,7 @@ def check_and_upgrade_mode(total_asset_krw):
 user_config = load_config()
 base_config = get_effective_market_config(user_config)
 IS_SAFE_MODE = True if base_config.get("trading_mode") == "safe" else False
-STRATEGY_MODE = base_config.get("strategy", "day")  # 'day', 'swing', or 'dca'
+STRATEGY_MODE = base_config.get("strategy", "day")  # 'day', 'swing', 'dca', or 'aggressive_dca'
 PERSONA = base_config.get("persona", "aggressive") # 'aggressive', 'neutral', 'conservative'
 
 DCA_SETTINGS = user_config.get("dca_settings", {
@@ -220,6 +221,24 @@ DCA_LEVERAGED_REENTRY_INTERVAL_MIN = DCA_SETTINGS.get(
     DCA_LEVERAGED_REENTRY_INTERVAL_MIN
 )
 DCA_MAX_BUYS_PER_SESSION = DCA_SETTINGS.get("max_buys_per_session", DCA_MAX_BUYS_PER_SESSION)
+
+# === [v4.0] Aggressive DCA Settings ===
+AGGRESSIVE_DCA_SETTINGS = user_config.get("aggressive_dca", {
+    "averaging_down_enabled": True,
+    "averaging_down_trigger_pct": -2.0,
+    "averaging_down_max_per_session": 2,
+    "panic_gap_down_threshold_pct": 8.0,
+    "portfolio_drawdown_halt_pct": 10.0,
+    "skip_ai_check": True,
+    "skip_trend_filter": True,
+    "skip_correlation_check": True,
+    "instant_buy_on_open": True,
+})
+AGG_DCA_AVG_DOWN_ENABLED = AGGRESSIVE_DCA_SETTINGS.get("averaging_down_enabled", True)
+AGG_DCA_AVG_DOWN_TRIGGER = AGGRESSIVE_DCA_SETTINGS.get("averaging_down_trigger_pct", -2.0)
+AGG_DCA_AVG_DOWN_MAX = AGGRESSIVE_DCA_SETTINGS.get("averaging_down_max_per_session", 2)
+AGG_DCA_PANIC_GAP = AGGRESSIVE_DCA_SETTINGS.get("panic_gap_down_threshold_pct", 8.0)
+AGG_DCA_DRAWDOWN_HALT = AGGRESSIVE_DCA_SETTINGS.get("portfolio_drawdown_halt_pct", 10.0)
 
 # Load Risk Management Settings from config (overrides defaults)
 risk_config = user_config.get("risk_management", {})
@@ -1429,7 +1448,130 @@ def job():
             logger.warning(f"[{ticker}] ⚠️ CONSECUTIVE DECLINE! ({cum_drop_pct:.1f}% over {CONSECUTIVE_DECLINE_DAYS} days)")
             send_alert(f"⚠️ [{ticker}] {CONSECUTIVE_DECLINE_DAYS}일 연속 하락! 누적 {cum_drop_pct:.1f}%")
 
-        # DCA 전략
+        # === [v4.0] Aggressive DCA 전략 — 무조건 분할매수 + 엄격한 리스크 관리 ===
+        if STRATEGY_MODE == 'aggressive_dca':
+            # Step 0: 기존 보유분 → 손절 체크만 수행
+            if ticker in current_holdings:
+                holding_qty = 0
+                holding_avg_price = 0
+                try:
+                    for h in balance.get('output1', []):
+                        if h.get('pdno') == ticker or h.get('ovrs_pdno') == ticker:
+                            holding_qty = int(safe_float(h.get('hldg_qty', h.get('ovrs_cblc_qty', h.get('ord_psbl_qty', '0')))))
+                            holding_avg_price = safe_float(h.get('pchs_avg_pric', h.get('avg_unpr3', 0)))
+                            break
+                except:
+                    pass
+
+                if holding_qty <= 0:
+                    logger.info(f"[{ticker}] 보유 수량 0, 스킵")
+                    continue
+
+                if holding_avg_price > 0 and current_price > 0:
+                    pnl_pct = ((current_price - holding_avg_price) / holding_avg_price) * 100
+                    logger.info(f"[{ticker}] 📊 보유: {holding_qty}주, 평단가: {holding_avg_price:.2f}, 현재가: {current_price:.2f}, 손익: {pnl_pct:.2f}%")
+
+                    # 손절매 체크
+                    if pnl_pct <= eff_stop_loss:
+                        logger.warning(f"[{ticker}] 🛑 STOP LOSS! ({pnl_pct:.2f}% <= {eff_stop_loss}%). {holding_qty}주 매도.")
+                        send_alert(f"🛑 [{ticker}] 손절매! {pnl_pct:.2f}%. {holding_qty}주 매도.")
+                        _sl = safe_sell(kis, market, ticker, holding_qty, exchange,
+                                        reason='손절매', monitor_data=monitoring_targets.get(ticker))
+                        if _sl['phase'] == 'deferred':
+                            continue
+                        if _sl['success'] or _sl['phase'] == 'already_flat':
+                            monitoring_targets[ticker] = {'target': current_price, 'status': 'sold_sl', 'buys': 0, 'exchange': exchange}
+                        else:
+                            monitoring_targets[ticker] = {'target': current_price, 'status': 'stop_loss_failed',
+                                                          'buys': holding_qty, 'exchange': exchange,
+                                                          'buy_price': holding_avg_price, 'stop_loss_fail_count': 1}
+                        continue
+
+                # 보유 종목 → 모니터링 등록 (물타기 대상)
+                monitoring_targets[ticker] = {
+                    'target': current_price, 'status': 'bought', 'buys': holding_qty,
+                    'exchange': exchange,
+                    'buy_price': holding_avg_price if holding_avg_price > 0 else current_price,
+                    'highest_price': current_price,
+                    'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
+                    'dca_buys_this_session': 0, 'avg_down_count': 0,
+                    'last_dca_attempt_at': None,
+                    'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
+                }
+                continue
+
+            # Step 1: 신규 매수 — 극단적 차단 조건만 확인
+            buy_blocked = False
+            block_reason = ""
+
+            # (1) 패닉 갭다운 (>8%) — 하루 대기
+            if is_gap_down and gap_drop_pct >= AGG_DCA_PANIC_GAP:
+                buy_blocked = True
+                block_reason = f"패닉 갭다운 {gap_drop_pct:.1f}% (>{AGG_DCA_PANIC_GAP}%)"
+
+            # (2) 가용 현금 부족
+            if available_cash < current_price:
+                buy_blocked = True
+                block_reason = f"자금 부족 (현금 {available_cash:.0f} < 1주 {current_price:.0f})"
+
+            if buy_blocked:
+                logger.info(f"[{ticker}] ⛔ 매수 차단: {block_reason}")
+                monitoring_targets[ticker] = {
+                    'target': current_price, 'status': 'blocked', 'buys': 0,
+                    'exchange': exchange, 'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
+                    'block_reason': block_reason,
+                }
+                continue
+
+            # Step 2: 무조건 매수 실행!
+            qty = calculate_dca_quantity(available_cash, current_price, num_active_targets, DCA_SETTINGS, market,
+                                         weight=ticker_weights.get(ticker, 1.0))
+            if qty <= 0:
+                logger.info(f"[{ticker}] 매수 수량 0 (투자금액 부족)")
+                monitoring_targets[ticker] = {
+                    'target': current_price, 'status': 'dca_wait', 'buys': 0,
+                    'exchange': exchange, 'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
+                    'dca_buys_this_session': 0, 'last_dca_attempt_at': None,
+                    'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
+                }
+                continue
+
+            currency = "$" if market == 'US' else "₩"
+            logger.info(f"[{ticker}] 🚀 공격적 DCA 매수: {qty}주 @ {currency}{current_price:,.2f}")
+            if market == 'US':
+                res = kis.buy_market_order(ticker, qty, exchange)
+            else:
+                res = kis.buy_market_order(ticker, qty)
+
+            if res and res.get('rt_cd') == '0':
+                logger.info(f"[{ticker}] ✅ 공격적 DCA 매수 성공! {qty}주")
+                send_alert(f"🚀 [{ticker}] 공격적 DCA 매수 성공! {qty}주 @ {currency}{current_price:,.2f}")
+                monitoring_targets[ticker] = {
+                    'target': current_price, 'status': 'bought', 'buys': qty,
+                    'exchange': exchange,
+                    'buy_price': current_price, 'highest_price': current_price,
+                    'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
+                    'entry_time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'dca_buys_this_session': 1, 'avg_down_count': 0,
+                    'last_dca_attempt_at': datetime.datetime.now(),
+                    'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
+                }
+                # 현금 차감 (다음 종목 수량 계산에 반영)
+                available_cash -= (qty * current_price)
+            else:
+                err_msg = res.get('msg1', 'unknown') if res else 'no response'
+                logger.error(f"[{ticker}] ❌ 매수 실패: {err_msg}")
+                if res and res.get('msg_cd') in ['APBK1680', 'APBK1681']:
+                    FAILED_TICKERS.add(ticker)
+                monitoring_targets[ticker] = {
+                    'target': current_price, 'status': 'dca_wait', 'buys': 0,
+                    'exchange': exchange, 'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
+                    'dca_buys_this_session': 0, 'last_dca_attempt_at': datetime.datetime.now(),
+                    'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
+                }
+            continue
+
+        # DCA 전략 (기존 — 조건부 매수)
         if STRATEGY_MODE == 'dca':
             # === [NEW] Step 0: 기존 보유분 리스크 체크 (DCA도 반드시 실행) ===
             if ticker in current_holdings:
@@ -1452,7 +1594,7 @@ def job():
                 if holding_avg_price > 0 and current_price > 0:
                     pnl_pct = ((current_price - holding_avg_price) / holding_avg_price) * 100
                     logger.info(f"[{ticker}] 📊 보유현황: {holding_qty}주, 평단가: {holding_avg_price:.2f}, 현재가: {current_price:.2f}, 손익: {pnl_pct:.2f}%")
-                    
+
                     # Stop Loss - 시장/종목별 차별화 (KR 개별주는 완화)
                     if pnl_pct <= eff_stop_loss:
                         logger.warning(f"[{ticker}] 🛑 DCA STOP LOSS! ({pnl_pct:.2f}% <= {eff_stop_loss}%). 즉시 매도 {holding_qty}주.")
@@ -1646,13 +1788,15 @@ def job():
         logger.error(f"Portfolio drawdown check failed: {e}")
 
     # DCA 모드: 매수 후에도 감시 루프 진입 (보유분 StopLoss/TrailingStop 모니터링)
-    if STRATEGY_MODE == 'dca':
+    if STRATEGY_MODE in ('dca', 'aggressive_dca'):
         bought_positions = {k: v for k, v in monitoring_targets.items() if v['status'] == 'bought'}
         waiting_positions = {k: v for k, v in monitoring_targets.items() if v['status'] == 'dca_wait'}
+        blocked_positions = {k: v for k, v in monitoring_targets.items() if v.get('status') == 'blocked'}
         logger.info(
-            f"[{market}] DCA Mode - Monitoring bought={list(bought_positions.keys())}, "
-            f"waiting={list(waiting_positions.keys())}, base_reentry={DCA_REENTRY_INTERVAL_MIN}min, "
-            f"leveraged_reentry={DCA_LEVERAGED_REENTRY_INTERVAL_MIN}min"
+            f"[{market}] {'Aggressive ' if STRATEGY_MODE == 'aggressive_dca' else ''}DCA Mode - "
+            f"Monitoring bought={list(bought_positions.keys())}, "
+            f"waiting={list(waiting_positions.keys())}, "
+            f"blocked={list(blocked_positions.keys())}"
         )
 
     # 활성 모니터링 대상 수 업데이트
@@ -2091,7 +2235,54 @@ def job():
                             
                 except Exception as e:
                     logger.error(f"[{ticker}] Error in Risk Management: {e}")
-                
+
+                # === [v4.0] Aggressive DCA: 장중 물타기 (Averaging Down) ===
+                # 리스크 관리(손절/트레일링) 통과 후, 보유 종목이 하락 중이면 물타기
+                if STRATEGY_MODE == 'aggressive_dca' and AGG_DCA_AVG_DOWN_ENABLED:
+                    try:
+                        avg_down_count = data.get('avg_down_count', 0)
+                        if avg_down_count < AGG_DCA_AVG_DOWN_MAX:
+                            now_dt = datetime.datetime.now()
+                            last_attempt = data.get('last_dca_attempt_at')
+                            if not last_attempt or (now_dt - last_attempt).total_seconds() >= (DCA_REENTRY_INTERVAL_MIN * 60):
+                                _exchange = data.get('exchange')
+                                _buy_price = data.get('buy_price', 0)
+                                if _buy_price > 0:
+                                    if market == 'US':
+                                        _ws_p = WS_PRICES.get(ticker, 0.0)
+                                        _curr = _ws_p if _ws_p > 0 else safe_float(kis.get_current_price(ticker, _exchange) or 0)
+                                    else:
+                                        _curr = safe_float(kis.get_current_price(ticker) or 0)
+                                    if _curr > 0:
+                                        _pnl = ((_curr - _buy_price) / _buy_price) * 100
+                                        if _pnl < AGG_DCA_AVG_DOWN_TRIGGER and _pnl > STOP_LOSS_PCT:
+                                            _qty = calculate_dca_quantity(available_cash, _curr, num_active_targets,
+                                                                          DCA_SETTINGS, market,
+                                                                          weight=ticker_weights.get(ticker, 1.0))
+                                            if _qty > 0:
+                                                _currency = "$" if market == 'US' else "₩"
+                                                logger.info(f"[{ticker}] 📉 물타기: {_qty}주 @ {_currency}{_curr:,.2f} (손익 {_pnl:.2f}%)")
+                                                if market == 'US':
+                                                    _res = kis.buy_market_order(ticker, _qty, _exchange)
+                                                else:
+                                                    _res = kis.buy_market_order(ticker, _qty)
+                                                if _res and _res.get('rt_cd') == '0':
+                                                    _old = data.get('buys', 0)
+                                                    _total = _old + _qty
+                                                    _blend = ((_buy_price * _old) + (_curr * _qty)) / _total if _total > 0 else _curr
+                                                    data['buys'] = _total
+                                                    data['buy_price'] = _blend
+                                                    data['avg_down_count'] = avg_down_count + 1
+                                                    data['last_dca_attempt_at'] = now_dt
+                                                    available_cash -= (_qty * _curr)
+                                                    logger.info(f"[{ticker}] ✅ 물타기 성공! 평단가: {_currency}{_blend:,.2f} ({_total}주)")
+                                                    send_alert(f"📉 [{ticker}] 물타기 {_qty}주 @ {_currency}{_curr:,.2f}\n평단가: {_currency}{_blend:,.2f}")
+                                                else:
+                                                    data['last_dca_attempt_at'] = now_dt
+                                                    logger.error(f"[{ticker}] ❌ 물타기 실패: {_res}")
+                    except Exception as _avg_e:
+                        logger.error(f"[{ticker}] 물타기 오류: {_avg_e}")
+
                 continue # Skip breakout check if already bought
 
             if STRATEGY_MODE == 'dca':
@@ -2352,7 +2543,7 @@ def job():
                     data['ai_retry_cooldown_sec'] = AI_RETRY_COOLDOWN_SEC
 
         # DCA 모드는 감시 간격을 넓힘 (API 호출 절약)
-        if STRATEGY_MODE == 'dca':
+        if STRATEGY_MODE in ('dca', 'aggressive_dca'):
             time.sleep(DCA_MONITOR_INTERVAL)
         else:
             time.sleep(1)  # VBO/Day 모드는 1초 간격

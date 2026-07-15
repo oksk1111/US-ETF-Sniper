@@ -8,7 +8,7 @@ KIS_APP_KEY = os.getenv("KIS_APP_KEY")
 KIS_APP_SECRET = os.getenv("KIS_APP_SECRET")
 KIS_CANO = os.getenv("KIS_CANO")
 KIS_ACNT_PRDT_CD = os.getenv("KIS_ACNT_PRDT_CD")
-KIS_MOCK = os.getenv("KIS_MOCK", "True").lower() == "true"
+KIS_MOCK = os.getenv("KIS_MOCK", "False").lower() == "true"
 
 # Gemini API Config
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")

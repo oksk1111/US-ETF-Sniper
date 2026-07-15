@@ -182,15 +182,20 @@ class TestV25CorrelationCap(unittest.TestCase):
         capped, _ = run_bot.is_correlation_capped("SOXL", targets)
         self.assertFalse(capped)  # 1개 보유 < cap(2)
 
-    def test_at_cap_blocks(self):
+    def test_at_cap_disabled_allows_all(self):
+        """v4.0: Correlation cap은 aggressive_dca에서 비활성화됨"""
         run_bot = _get_run_bot()
         targets = {
             "TQQQ": {"status": "bought", "buys": 5},
             "TECL": {"status": "bought", "buys": 3},
         }
         capped, grp = run_bot.is_correlation_capped("SOXL", targets)
-        self.assertTrue(capped)
-        self.assertIsNotNone(grp)
+        # correlation_cap_enabled=False이면 항상 허용
+        if not run_bot.CORRELATION_CAP_ENABLED:
+            self.assertFalse(capped)
+        else:
+            self.assertTrue(capped)
+            self.assertIsNotNone(grp)
 
 
 class TestV25LosingStreak(unittest.TestCase):
@@ -206,15 +211,22 @@ class TestV25LosingStreak(unittest.TestCase):
         self.run_bot._record_loss_event(-2.0, 'stop_loss')
         self.assertFalse(self.run_bot.is_losing_streak_pause())
 
-    def test_max_stops_triggers_pause(self):
+    def test_max_stops_no_pause_when_disabled(self):
+        """v4.0: Losing streak은 비활성화 — 손절 후에도 매수 차단 안 함"""
         for _ in range(self.run_bot.LOSING_STREAK_MAX_STOPS):
             self.run_bot._record_loss_event(-0.5, 'stop_loss')
-        self.assertTrue(self.run_bot.is_losing_streak_pause())
+        if not self.run_bot.LOSING_STREAK_ENABLED:
+            self.assertFalse(self.run_bot.is_losing_streak_pause())
+        else:
+            self.assertTrue(self.run_bot.is_losing_streak_pause())
 
-    def test_cumulative_pnl_triggers_pause(self):
-        # 누적 손실이 임계치 이하 → pause
+    def test_cumulative_pnl_no_pause_when_disabled(self):
+        """v4.0: 누적 손실이 커도 매수 차단 안 함 (비활성화 시)"""
         self.run_bot._record_loss_event(-5.0, 'trailing_stop')
-        self.assertTrue(self.run_bot.is_losing_streak_pause())
+        if not self.run_bot.LOSING_STREAK_ENABLED:
+            self.assertFalse(self.run_bot.is_losing_streak_pause())
+        else:
+            self.assertTrue(self.run_bot.is_losing_streak_pause())
 
 
 if __name__ == '__main__':

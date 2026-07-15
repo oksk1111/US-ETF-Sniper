@@ -6,7 +6,8 @@
 [![Telegram](https://img.shields.io/badge/notify-Telegram-2CA5E0)](#)
 
 미국/국내 주식 자동매매 시스템입니다.
-룰 기반 전략(VBO, MA)과 AI 보조 분석을 결합해 매수/매도 의사결정을 자동화하고, FastAPI 대시보드로 운영 상태를 모니터링합니다.
+**공격적 DCA(분할매수)** 전략으로 시장 오픈 시 무조건 매수를 실행하고, 엄격한 리스크 관리(손절/트레일링)로 손실을 제한합니다.
+FastAPI 대시보드로 운영 상태를 모니터링합니다.
 
 빠른 이동: [Key Features](#-key-features) · [Quick Start](#-quick-start) · [Configuration](#-configuration) · [Backtest Automation](#-backtest-automation) · [Dashboard](#️-dashboard)
 
@@ -15,13 +16,14 @@
 | 모듈 | 기능 | 설명 |
 |------|------|------|
 | Trading Engine | 실시간 웹소켓 + 자동매매 | 장 상태 감지 및 미국 시장 실시간 웹소켓(WebSocket) 스트리밍 가격 수신을 통한 초저지연 실시간 시세 감시 및 고성능 변동성 돌파 구현 |
-| Strategy | 다중 전략 | `day`, `swing`, `dca` 전략과 `safe/risky` 모드 지원 |
+| Strategy | 다중 전략 | `aggressive_dca`(기본), `day`, `swing`, `dca` 전략과 `safe/risky` 모드 지원 |
+| **Aggressive DCA** | **무조건 분할매수** | 시장 오픈 시 조건 없이 즉시 매수 + 장중 물타기. AI/MA 필터 없음 (v4.0) |
 | Risk Control | 리스크 관리 | 손절, 트레일링 스탑, 갭다운/연속하락/포트폴리오 드로다운 방어, **시장가→지정가 fallback 매도** |
 | Rebound Trigger | 변동성 반등 매수 | 큰 하락 후 당일 반등 시 50% 수량으로 역방향 진입 (v2.3) |
 | Partial Take-Profit | 1차 부분 익절 | Trailing 활성가 도달 시 50% 청산 + 잔량 trailing (v2.4) |
 | Breakeven Stop | 본전 스탑 | 고점 +3%/+4% 도달 후 손절선을 매수가 +0.2% 위로 끌어올림 (v2.5) |
 | Correlation Cap | 상관 그룹 한도 | 동일 섹터 그룹 동시 보유 최대 2종목 (v2.5) |
-| Losing Streak Throttle | 일일 손실 회로차단 | 손절 3건 또는 누적 -3% 시 신규 매수 즉시 중단 (v2.5) |
+| ~~Losing Streak Throttle~~ | ~~일일 손실 회로차단~~ | ~~비활성화 (v4.0)~~ — 매수 차단이 수익 기회를 상실시킴 |
 | ATR Dynamic Stop | 변동성 적응 손절 | 14일 ATR 기반으로 종목별 손절폭 동적 보강 (v2.5) |
 | AI Assist | 시장 보조 분석 | 뉴스 기반 위험도 판단 및 매수 제한(페르소나 반영) |
 | Dynamic Portfolio | 동적 포트폴리오 | 고품질 ETF 풀 중 모멘텀/안정성이 우수한 종목을 시스템이 주기적으로 자동 필터링 및 교체(삭제) |
