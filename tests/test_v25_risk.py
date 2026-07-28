@@ -183,7 +183,9 @@ class TestV25CorrelationCap(unittest.TestCase):
         self.assertFalse(capped)  # 1개 보유 < cap(2)
 
     def test_at_cap_disabled_allows_all(self):
-        """v4.0: Correlation cap은 aggressive_dca에서 비활성화됨"""
+        """v5.0: Correlation cap은 기본적으로 다시 활성화됨 (v4.0에서 비활성화했던 것을 복원).
+        current_config.json의 correlation_cap_enabled 값에 따라 동작이 갈리므로,
+        어느 쪽이든 설정과 일치하게 동작하는지만 확인한다."""
         run_bot = _get_run_bot()
         targets = {
             "TQQQ": {"status": "bought", "buys": 5},

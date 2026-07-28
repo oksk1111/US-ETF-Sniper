@@ -28,35 +28,43 @@ import time as _time
 _CONSENSUS_CACHE: dict = {}
 _CONSENSUS_CACHE_TTL_SEC = 300  # 5분
 
+# [v5.0] 섹터 특화 뉴스 veto 캐시 — 종목마다 매 사이클 LLM을 호출하면 API 쿼터가
+# 빠르게 소진되므로, 섹터 단위(반도체/나스닥 등)로 30분 캐시한다.
+_SECTOR_CACHE: dict = {}
+_SECTOR_CACHE_TTL_SEC = 1800  # 30분
+
 
 def _cache_key(news_text: str, persona: str) -> str:
     h = hashlib.sha256(f"{persona}::{news_text or ''}".encode("utf-8")).hexdigest()
     return h[:32]
 
 
-def _cache_get(key: str):
-    item = _CONSENSUS_CACHE.get(key)
+def _cache_get(key: str, store: dict = None, ttl: int = None):
+    store = _CONSENSUS_CACHE if store is None else store
+    ttl = _CONSENSUS_CACHE_TTL_SEC if ttl is None else ttl
+    item = store.get(key)
     if not item:
         return None
     ts, value = item
-    if _time.time() - ts > _CONSENSUS_CACHE_TTL_SEC:
+    if _time.time() - ts > ttl:
         try:
-            del _CONSENSUS_CACHE[key]
+            del store[key]
         except KeyError:
             pass
         return None
     return value
 
 
-def _cache_put(key: str, value: dict) -> None:
+def _cache_put(key: str, value: dict, store: dict = None) -> None:
+    store = _CONSENSUS_CACHE if store is None else store
     # 단순 LRU 흉내: 200개 초과 시 가장 오래된 항목 1개 제거
-    if len(_CONSENSUS_CACHE) > 200:
+    if len(store) > 200:
         try:
-            oldest = min(_CONSENSUS_CACHE.items(), key=lambda kv: kv[1][0])[0]
-            del _CONSENSUS_CACHE[oldest]
+            oldest = min(store.items(), key=lambda kv: kv[1][0])[0]
+            del store[oldest]
         except Exception:
             pass
-    _CONSENSUS_CACHE[key] = (_time.time(), value)
+    store[key] = (_time.time(), value)
 
 
 class MultiLLMAnalyst:
@@ -325,3 +333,54 @@ class MultiLLMAnalyst:
         except Exception:
             pass
         return consensus_result
+
+    # === [v5.0 신규] 섹터 특화 뉴스 veto ===
+    # 배경: 반도체 업종 전체가 무너지는 와중에도 "시장 전체" 판단만으로는 감지되지 않아
+    # SOXL/SMH 등을 계속 물타기 매수한 사고(2026-07)를 막기 위한 전용 게이트.
+    # 전체 합의(4-LLM) 대신 Gemini 단독으로 처리한다 — 종목마다 섹터 체크가 발생하므로
+    # 4-LLM 합의로 처리하면 무료 API 쿼터가 감당 못할 정도로 소진된다. 대신 페르소나에
+    # 흔들리지 않는 엄격한 전용 프롬프트(check_sector_crash)를 사용해 신뢰도를 보강한다.
+    def fetch_sector_news(self, sector_key, query, lang="en"):
+        """섹터 전용 뉴스 수집 (Gemini 담당, Google News RSS)."""
+        gemini = self.analysts[0] if self.analysts else None
+        if gemini is None or not hasattr(gemini, 'fetch_topic_news'):
+            return ""
+        try:
+            return gemini.fetch_topic_news(query, lang=lang)
+        except Exception as e:
+            logger.error(f"[MultiLLM] 섹터 뉴스 수집 실패({sector_key}): {e}")
+            return ""
+
+    def check_sector_sentiment(self, sector_key, sector_label, news_text):
+        """섹터 단위 크래시 판별 (30분 캐시). persona 인자를 받지 않는다 — 자본보호 전용
+        게이트는 공격적 페르소나에도 완화되지 않아야 하기 때문."""
+        if not news_text:
+            return {"risk_level": "LOW", "can_buy": True, "market_condition": "NEUTRAL",
+                     "reason": "No sector news, skipping.", "consensus": "N/A"}
+
+        _ck = _cache_key(news_text, f"sector::{sector_key}")
+        cached = _cache_get(_ck, store=_SECTOR_CACHE, ttl=_SECTOR_CACHE_TTL_SEC)
+        if cached is not None:
+            logger.info(f"[MultiLLM] 섹터 캐시 HIT ({sector_key})")
+            return cached
+
+        gemini = self.analysts[0] if self.analysts else None
+        if gemini is None or not hasattr(gemini, 'check_sector_crash'):
+            return {"risk_level": "LOW", "can_buy": True, "market_condition": "NEUTRAL",
+                     "reason": "Sector check unavailable, defaulting to safe-pass.", "consensus": "N/A"}
+
+        try:
+            result = gemini.check_sector_crash(sector_label, news_text)
+        except Exception as e:
+            logger.error(f"[MultiLLM] 섹터 판별 실패({sector_key}): {e}")
+            return {"risk_level": "LOW", "can_buy": True, "market_condition": "NEUTRAL",
+                     "reason": f"Sector check error: {e}", "consensus": "ERROR_SAFE_PASS"}
+
+        result["consensus"] = f"SECTOR:{sector_key}"
+        if result.get("market_condition") == "CRASH":
+            logger.warning(f"[MultiLLM] ⚠️ 섹터 CRASH 감지: {sector_label} - {result.get('reason', 'N/A')}")
+        try:
+            _cache_put(_ck, result, store=_SECTOR_CACHE)
+        except Exception:
+            pass
+        return result

@@ -2,6 +2,7 @@ import google.generativeai as genai
 import requests
 import xml.etree.ElementTree as ET
 import json
+import urllib.parse
 from config import GEMINI_API_KEY
 
 class GeminiAnalyst:
@@ -57,6 +58,91 @@ class GeminiAnalyst:
         except Exception as e:
             print(f"[Gemini] Failed to fetch news: {e}")
             return ""
+
+    def fetch_topic_news(self, query, lang="en"):
+        """[v5.0 신규] 특정 주제/섹터(예: 반도체) 뉴스만 골라 수집 (Google News RSS, API 키 불필요).
+
+        전체 시장 뉴스(fetch_news)와 달리, query로 좁힌 섹터/테마 뉴스만 가져와
+        섹터 단위 위험 판별(check_sector_crash)에 사용한다.
+        """
+        if lang == "ko":
+            url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=ko&gl=KR&ceid=KR:ko"
+        else:
+            url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=en-US&gl=US&ceid=US:en"
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+
+            headlines = []
+            for item in root.findall('./channel/item'):
+                title_el = item.find('title')
+                title = title_el.text if title_el is not None else ""
+                if title:
+                    headlines.append(f"- {title}")
+                if len(headlines) >= 8:  # Top 8 only (섹터 뉴스는 소수 헤드라인으로 충분)
+                    break
+
+            return "\n".join(headlines)
+        except Exception as e:
+            print(f"[Gemini] Failed to fetch topic news ({query}): {e}")
+            return ""
+
+    def check_sector_crash(self, sector_label, news_text):
+        """[v5.0 신규] 섹터 특화 크래시 판별 — 트레이딩 페르소나(공격적/중립/보수)와 무관하게
+        항상 엄격/객관적으로 판단한다.
+
+        목적: "전체 시장은 괜찮지만 이 섹터만 무너지는" 상황(예: 반도체 수출규제)을
+        페르소나에 관계없이 감지하기 위한 자본보호 전용 게이트. aggressive 페르소나가
+        "핵전쟁 수준 아니면 사라"고 지시하는 것과 별개로 동작해야 하므로 페르소나 인자를
+        받지 않는다.
+        """
+        if not self.model:
+            return {"risk_level": "LOW", "can_buy": True, "market_condition": "NEUTRAL",
+                     "reason": "API Key missing, skipping sector check.", "source": "gemini"}
+        if not news_text:
+            return {"risk_level": "LOW", "can_buy": True, "market_condition": "NEUTRAL",
+                     "reason": "No sector news found, skipping sector check.", "source": "gemini"}
+
+        prompt = f"""
+        Act as a conservative risk-control officer for an automated trading system.
+        Your ONLY job is capital preservation for ONE specific sector: "{sector_label}".
+        Ignore general trading opportunism — you are a circuit breaker, not a trader.
+
+        Here are the latest news headlines specifically about the "{sector_label}" sector:
+        {news_text}
+
+        Critical Check (sector-specific, not whole-market):
+        1. Is there a severe negative shock specific to this sector (e.g. export ban,
+           regulatory crackdown, demand collapse, major sell-off, oversupply crisis)?
+        2. Would a reasonable risk manager pause NEW buying in this sector right now?
+
+        Reply with JSON ONLY:
+        {{
+            "risk_level": "HIGH" or "LOW",
+            "can_buy": boolean,
+            "market_condition": "CRASH" or "BEARISH" or "NEUTRAL" or "BULLISH",
+            "reason": "short summary"
+        }}
+        """
+
+        try:
+            response = self.model.generate_content(prompt, request_options={"timeout": 15})
+            text = response.text.strip()
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.endswith("```"):
+                text = text[:-3]
+
+            result = json.loads(text)
+            result["source"] = "gemini"
+            if "market_condition" not in result:
+                result["market_condition"] = "BEARISH" if result.get("risk_level") == "HIGH" else "NEUTRAL"
+            return result
+        except Exception as e:
+            print(f"[Gemini] Sector crash check failed ({sector_label}): {e}")
+            return {"risk_level": "UNKNOWN", "can_buy": False, "market_condition": "UNKNOWN",
+                     "reason": f"AI Error: {e}", "source": "gemini"}
 
     def check_market_sentiment(self, news_text, persona="aggressive"):
         if not self.model:

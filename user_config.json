@@ -3,7 +3,7 @@
     "trading_mode": "safe",
     "theme_mode": "light",
     "strategy": "aggressive_dca",
-    "persona": "aggressive",
+    "persona": "neutral",
     "leverage_threshold_krw": 15000000,
     "max_retries_per_ticker": 5,
     "signal_thresholds": {
@@ -11,11 +11,19 @@
         "medium": 0.55,
         "weak": 0.35
     },
+    "market_settings": {
+        "us": {
+            "persona": "neutral"
+        },
+        "kr": {
+            "persona": "conservative"
+        }
+    },
     "llm_consensus": {
-        "crash_veto": false,
+        "crash_veto": true,
         "min_successful_llms": 1,
-        "required_buy_ratio": 0.0,
-        "unknown_fallback_hold": false,
+        "required_buy_ratio": 0.5,
+        "unknown_fallback_hold": true,
         "tie_breaker": "persona"
     },
     "dca_settings": {
@@ -34,10 +42,10 @@
         "stop_loss_pct": -4.0,
         "trailing_stop_activation_pct": 4.0,
         "trailing_stop_drop_pct": 2.5,
-        "gap_down_threshold_pct": 8.0,
+        "gap_down_threshold_pct": 5.0,
         "consecutive_decline_days": 3,
-        "consecutive_decline_pct": 10.0,
-        "portfolio_drawdown_pct": 10.0,
+        "consecutive_decline_pct": 5.0,
+        "portfolio_drawdown_pct": 7.0,
         "dca_monitor_interval_sec": 60,
         "rebound_buy_enabled": true,
         "rebound_drop_threshold_pct": 3.0,
@@ -49,11 +57,11 @@
         "breakeven_trigger_pct_us": 2.5,
         "breakeven_trigger_pct_kr_stock": 3.0,
         "breakeven_buffer_pct": 0.2,
-        "correlation_cap_enabled": false,
-        "correlation_max_per_group": 5,
-        "losing_streak_enabled": false,
-        "losing_streak_max_stops": 99,
-        "losing_streak_daily_pnl_pct": -99.0,
+        "correlation_cap_enabled": true,
+        "correlation_max_per_group": 2,
+        "losing_streak_enabled": true,
+        "losing_streak_max_stops": 3,
+        "losing_streak_daily_pnl_pct": -3.0,
         "atr_dynamic_stop_enabled": true,
         "atr_period": 14,
         "atr_stop_multiplier": 1.8,
@@ -83,13 +91,14 @@
     },
     "aggressive_dca": {
         "averaging_down_enabled": true,
-        "averaging_down_trigger_pct": -2.0,
+        "averaging_down_trigger_pct": -3.0,
         "averaging_down_max_per_session": 2,
         "panic_gap_down_threshold_pct": 8.0,
-        "portfolio_drawdown_halt_pct": 10.0,
-        "skip_ai_check": true,
-        "skip_trend_filter": true,
-        "skip_correlation_check": true,
+        "portfolio_drawdown_halt_pct": 7.0,
+        "skip_ai_check": false,
+        "skip_trend_filter": false,
+        "skip_correlation_check": false,
+        "sector_news_veto_enabled": true,
         "instant_buy_on_open": true
     },
     "telegram": {

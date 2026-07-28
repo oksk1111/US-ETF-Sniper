@@ -25,6 +25,7 @@ except Exception as _scanner_err:
     print(f"[WARN] market_scanner import failed (bot will run without scanner): {_scanner_err}")
 from modules.multi_llm import MultiLLMAnalyst
 from modules.auto_strategy import AutoStrategyOptimizer
+from modules.sector_news import get_sector, get_sector_meta
 from modules import trade_journal
 
 def safe_float(value, default=0.0):
@@ -222,23 +223,33 @@ DCA_LEVERAGED_REENTRY_INTERVAL_MIN = DCA_SETTINGS.get(
 )
 DCA_MAX_BUYS_PER_SESSION = DCA_SETTINGS.get("max_buys_per_session", DCA_MAX_BUYS_PER_SESSION)
 
-# === [v4.0] Aggressive DCA Settings ===
+# === [v5.0] Guarded DCA Settings (구 "Aggressive DCA") ===
+# v4.0에서는 skip_* 를 전부 True로 두어 "묻지마 매수"를 실행했으나, 이것이 반도체
+# 섹터 붕괴(2026-07 중국발 규제 뉴스) 국면에서 SOXL/SMH를 뉴스 무시하고 계속
+# 물타기 매수하게 만든 근본 원인이었다. v5.0부터는 기본값을 전부 False(게이트 적용)로
+# 되돌리고, "무조건 매수"가 아니라 "매수 주기는 공격적으로 자주 하되, 게이트를
+# 통과하지 못하면 사지 않는다"로 의미를 바꾼다.
 AGGRESSIVE_DCA_SETTINGS = user_config.get("aggressive_dca", {
     "averaging_down_enabled": True,
-    "averaging_down_trigger_pct": -2.0,
+    "averaging_down_trigger_pct": -3.0,
     "averaging_down_max_per_session": 2,
     "panic_gap_down_threshold_pct": 8.0,
-    "portfolio_drawdown_halt_pct": 10.0,
-    "skip_ai_check": True,
-    "skip_trend_filter": True,
-    "skip_correlation_check": True,
+    "portfolio_drawdown_halt_pct": 7.0,
+    "skip_ai_check": False,
+    "skip_trend_filter": False,
+    "skip_correlation_check": False,
+    "sector_news_veto_enabled": True,
     "instant_buy_on_open": True,
 })
 AGG_DCA_AVG_DOWN_ENABLED = AGGRESSIVE_DCA_SETTINGS.get("averaging_down_enabled", True)
-AGG_DCA_AVG_DOWN_TRIGGER = AGGRESSIVE_DCA_SETTINGS.get("averaging_down_trigger_pct", -2.0)
+AGG_DCA_AVG_DOWN_TRIGGER = AGGRESSIVE_DCA_SETTINGS.get("averaging_down_trigger_pct", -3.0)
 AGG_DCA_AVG_DOWN_MAX = AGGRESSIVE_DCA_SETTINGS.get("averaging_down_max_per_session", 2)
 AGG_DCA_PANIC_GAP = AGGRESSIVE_DCA_SETTINGS.get("panic_gap_down_threshold_pct", 8.0)
-AGG_DCA_DRAWDOWN_HALT = AGGRESSIVE_DCA_SETTINGS.get("portfolio_drawdown_halt_pct", 10.0)
+AGG_DCA_DRAWDOWN_HALT = AGGRESSIVE_DCA_SETTINGS.get("portfolio_drawdown_halt_pct", 7.0)
+AGG_DCA_SKIP_AI = bool(AGGRESSIVE_DCA_SETTINGS.get("skip_ai_check", False))
+AGG_DCA_SKIP_TREND = bool(AGGRESSIVE_DCA_SETTINGS.get("skip_trend_filter", False))
+AGG_DCA_SKIP_CORR = bool(AGGRESSIVE_DCA_SETTINGS.get("skip_correlation_check", False))
+AGG_DCA_SECTOR_VETO = bool(AGGRESSIVE_DCA_SETTINGS.get("sector_news_veto_enabled", True))
 
 # Load Risk Management Settings from config (overrides defaults)
 risk_config = user_config.get("risk_management", {})
@@ -989,10 +1000,39 @@ def job():
             
     llm_consensus_cfg = user_config.get("llm_consensus", {})
     ai = MultiLLMAnalyst(consensus_config=llm_consensus_cfg)
-    
+
+    def check_sector_news_veto(ticker):
+        """[v5.0] 섹터 특화 뉴스 veto. 전체 시장이 아니라 종목이 속한 섹터에
+        국한하여 판단한다 (예: 반도체만 나쁠 때 반도체 종목만 차단하고 다른
+        섹터의 매수 기회는 유지). 매핑되는 섹터가 없으면 항상 통과.
+        """
+        if not AGG_DCA_SECTOR_VETO:
+            return False, ""
+        sector = get_sector(ticker)
+        if not sector:
+            return False, ""
+        meta = get_sector_meta(sector) or {}
+        lang = "ko" if market == 'KR' else "en"
+        query = meta.get(f"query_{lang}") or meta.get("query_en", sector)
+        try:
+            news = ai.fetch_sector_news(sector, query, lang=lang)
+            sent = ai.check_sector_sentiment(sector, meta.get("label_kr", sector), news)
+        except Exception as e:
+            logger.error(f"[{ticker}] 섹터 뉴스 체크 실패({sector}): {e}")
+            return False, ""
+        if sent.get('market_condition') == 'CRASH' or sent.get('risk_level') == 'HIGH':
+            reason = f"[{meta.get('label_kr', sector)}] 섹터 악재: {sent.get('reason', 'N/A')[:80]}"
+            logger.warning(f"[{ticker}] 🚫 섹터 뉴스 veto ({sector}) - {reason}")
+            return True, reason
+        return False, ""
+
     # Dictionary to store monitoring targets
     monitoring_targets = {}
     skipped_buy_reasons = {}
+    # [v5.0] 세션 동안 실제로 체결된 매수 건수 — 0건이면 세션 종료 시 별도 경고.
+    # "미국장이 몇 주째 거래가 안 된다"처럼 매수가 조용히 전부 막히는 사고를
+    # (알림 없이) 방치하지 않기 위한 최소한의 자가 점검 장치.
+    session_buy_count = 0
 
     def record_skip_reason(ticker, reason):
         """매수 보류/차단 사유 추적"""
@@ -1047,7 +1087,13 @@ def job():
 
     def attempt_dca_buy(ticker, exchange, current_price, ma20, ma5, ohlc, eff_gap_down_threshold, num_targets):
         """DCA 후보를 재평가하여 조건 충족 시 1회 매수"""
+        nonlocal session_buy_count
         existing = monitoring_targets.get(ticker, {})
+
+        # [v5.0] 포트폴리오 드로다운 서킷브레이커 — 신규 매수 전면 차단
+        if portfolio_drawdown_halt:
+            record_skip_reason(ticker, f"포트폴리오 드로다운 {PORTFOLIO_DRAWDOWN_PCT}% 초과 — 신규 매수 중단")
+            return False
 
         # [v2.5] Losing-streak throttle: 오늘 누적 손실/손절 한도 초과 시 전 종목 매수 차단
         if is_losing_streak_pause():
@@ -1058,6 +1104,12 @@ def job():
         capped, grp = is_correlation_capped(ticker, monitoring_targets)
         if capped:
             record_skip_reason(ticker, f"상관그룹 한도 초과 (group={grp})")
+            return False
+
+        # [v5.0] 섹터 특화 뉴스 veto — 반도체 등 특정 섹터 악재 시 해당 섹터만 차단
+        _sec_blocked, _sec_reason = check_sector_news_veto(ticker)
+        if _sec_blocked:
+            record_skip_reason(ticker, _sec_reason)
             return False
 
         if existing.get('dca_buys_this_session', 0) >= DCA_MAX_BUYS_PER_SESSION:
@@ -1185,6 +1237,7 @@ def job():
 
         if res and res.get('rt_cd') == '0':
             logger.info(f"[{ticker}] ✅ DCA Buy Success! {qty} shares")
+            session_buy_count += 1
             total_qty = existing.get('buys', 0) + qty
             old_buy_price = existing.get('buy_price', 0)
             old_buys = existing.get('buys', 0)
@@ -1230,6 +1283,18 @@ def job():
             foreign_bal = kis.get_foreign_balance()
             if foreign_bal and 'deposit' in foreign_bal:
                 available_cash = safe_float(foreign_bal['deposit'])
+            else:
+                # [v5.0] 과거(2026-05/06) 여러 차례 "US 거래가 조용히 멈추는" 사고가
+                # 정확히 이 지점(잔고 조회 실패가 알림 없이 삼켜짐)에서 발생했다.
+                # get_foreign_balance()가 예외 없이 빈 응답을 주면 available_cash가
+                # 0으로 고정되어 이후 모든 US 티커가 "자금 부족"으로 매일 조용히
+                # 차단되는데, 이 사실이 텔레그램으로 전혀 보고되지 않았다. 반드시 알림.
+                logger.error(f"[US] get_foreign_balance() 응답에 'deposit' 없음: {foreign_bal}")
+                send_alert(
+                    "🚨 US 잔고 조회 실패 (deposit 필드 없음) — 이번 세션 매수가 전부 "
+                    "'자금 부족'으로 차단될 수 있습니다. KIS API/토큰 상태를 확인하세요.",
+                    is_error=True
+                )
             # US 계좌는 환율 적용하여 원화 환산 (대략 1350원)
             total_asset_krw = available_cash * 1350
         else:
@@ -1238,7 +1303,7 @@ def job():
                     available_cash = safe_float(balance['output2'][0].get('dnca_tot_amt', 0))
                     total_asset_krw = safe_float(balance['output2'][0].get('tot_evlu_amt', available_cash))
         logger.info(f"Available Cash: {available_cash:,.2f}, Total Asset (KRW): {total_asset_krw:,.0f}")
-        
+
         # 자동 모드 전환 체크 (1000만원 달성 시 레버리지 모드로)
         if check_and_upgrade_mode(total_asset_krw):
             # 모드가 변경되었으면 KR 설정만 다시 로드 (US는 항상 3X)
@@ -1248,9 +1313,10 @@ def job():
             if market == 'KR':
                 tickers = TARGET_TICKERS_KR
             logger.info(f"🔄 KR 모드 전환 완료! 새로운 KR 타겟: {TARGET_TICKERS_KR}")
-            
+
     except Exception as e:
-        logger.error(f"Failed to fetch balance: {e}")
+        logger.error(f"Failed to fetch balance: {e}", exc_info=True)
+        send_alert(f"🚨 [{market}] 잔고 조회 실패! 이번 세션 매수가 되지 않을 수 있습니다: {e}", is_error=True)
 
     # --- 0. Check Holding Status (Swing Strategy) ---
     current_holdings = []
@@ -1358,6 +1424,20 @@ def job():
     except Exception as e:
         logger.warning(f"[{market}] Failed to merge holdings into watch list: {e}")
     
+    # [v5.0] 포트폴리오 드로다운 서킷브레이커 — 신규 매수 진입 전에 먼저 평가한다.
+    # 기존에는 이 체크가 신규 매수 루프 "이후"에만 실행되어 경고만 보내고 실제로
+    # 그날 매수를 막지는 못했다 (알림은 갔지만 매수는 계속 실행됨). v5.0부터는
+    # 매수 루프 진입 "전"에 평가하여 실제로 신규 매수를 차단하는 플래그로 사용한다.
+    portfolio_drawdown_halt = False
+    try:
+        _holdings_pre = balance.get('output1', []) if balance else []
+        portfolio_drawdown_halt, _dd_loss_pct = check_portfolio_drawdown(_holdings_pre, PORTFOLIO_DRAWDOWN_PCT)
+        if portfolio_drawdown_halt:
+            logger.critical(f"🚨 PORTFOLIO DRAWDOWN ALERT! 전체 포트폴리오 손실 {_dd_loss_pct:.1f}% (기준: {PORTFOLIO_DRAWDOWN_PCT}%) → 신규 매수 전면 중단")
+            send_alert(f"🚨 포트폴리오 드로다운 경고! 전체 손실 {_dd_loss_pct:.1f}%. 신규 매수 중단 (보유분 리스크 관리는 계속).")
+    except Exception as e:
+        logger.error(f"Portfolio drawdown pre-check failed: {e}")
+
     # 활성 타겟 수 (분산 투자 계산용)
     num_active_targets = len(tickers)
 
@@ -1500,7 +1580,7 @@ def job():
                 }
                 continue
 
-            # Step 1: 신규 매수 — 극단적 차단 조건만 확인
+            # Step 1: 신규 매수 — v5.0부터 게이트를 전부 복원 (묻지마 매수 폐지)
             buy_blocked = False
             block_reason = ""
 
@@ -1510,12 +1590,65 @@ def job():
                 block_reason = f"패닉 갭다운 {gap_drop_pct:.1f}% (>{AGG_DCA_PANIC_GAP}%)"
 
             # (2) 가용 현금 부족
-            if available_cash < current_price:
+            if not buy_blocked and available_cash < current_price:
                 buy_blocked = True
                 block_reason = f"자금 부족 (현금 {available_cash:.0f} < 1주 {current_price:.0f})"
 
+            # (3) 포트폴리오 드로다운 서킷브레이커
+            if not buy_blocked and portfolio_drawdown_halt:
+                buy_blocked = True
+                block_reason = f"포트폴리오 드로다운 {PORTFOLIO_DRAWDOWN_PCT}% 초과 — 신규 매수 전면 중단"
+
+            # (4) 추세 이탈 — 레버리지는 10MA, 일반은 20MA 기준
+            if not buy_blocked and not AGG_DCA_SKIP_TREND:
+                is_lev = (market == 'US' and ticker in US_LEVERAGED_ETF_SYMBOLS) or ticker in LEVERAGED_ETF_FACTOR
+                if is_lev and len(ohlc) >= 10:
+                    _ma10 = calculate_ma([safe_float(x['clos']) for x in reversed(ohlc)], 10)
+                    trend_ok_buy = check_trend(current_price, _ma10) if _ma10 else is_uptrend
+                else:
+                    trend_ok_buy = is_uptrend
+                # KR 시장은 도메스틱 수급 변동성이 커서 5MA까지 함께 확인 (더 엄격한 확인)
+                if market == 'KR' and trend_ok_buy:
+                    trend_ok_buy = is_short_uptrend
+                if not trend_ok_buy:
+                    buy_blocked = True
+                    block_reason = "추세 이탈 (MA 하회) — 신규 매수 보류"
+
+            # (5) 상관 그룹 한도 — 같은 섹터/지수 그룹 동시 보유 제한
+            if not buy_blocked and not AGG_DCA_SKIP_CORR:
+                _capped, _grp = is_correlation_capped(ticker, monitoring_targets)
+                if _capped:
+                    buy_blocked = True
+                    block_reason = f"상관그룹 한도 초과 (group={_grp})"
+
+            # (6) 일일 손실 누적 서킷브레이커
+            if not buy_blocked and is_losing_streak_pause():
+                buy_blocked = True
+                block_reason = "일일 손실 한도 초과 — 신규 매수 중단"
+
+            # (7) 시장 전반 AI 뉴스 veto (기존 v4.0에서 꺼져 있던 것을 복원)
+            if not buy_blocked and not AGG_DCA_SKIP_AI:
+                try:
+                    _news = ai.fetch_news()
+                    _sent = ai.check_market_sentiment(_news, persona=PERSONA)
+                    if _sent.get('market_condition') == 'CRASH' or _sent.get('risk_level') == 'HIGH':
+                        buy_blocked = True
+                        block_reason = f"AI 시장 위험 감지: {_sent.get('reason', 'N/A')[:80]}"
+                except Exception as _ai_e:
+                    logger.error(f"[{ticker}] AI 시장 체크 실패 (안전을 위해 계속 진행): {_ai_e}")
+
+            # (8) [v5.0 신규] 섹터 특화 뉴스 veto — 반도체 등 특정 섹터 악재 시 해당
+            # 섹터 종목만 차단. 2026-07 반도체 붕괴 국면에서 SOXL/SMH를 뉴스 무시하고
+            # 계속 매수했던 사고의 직접적인 재발 방지책.
+            if not buy_blocked:
+                _sec_blocked, _sec_reason = check_sector_news_veto(ticker)
+                if _sec_blocked:
+                    buy_blocked = True
+                    block_reason = _sec_reason
+
             if buy_blocked:
                 logger.info(f"[{ticker}] ⛔ 매수 차단: {block_reason}")
+                record_skip_reason(ticker, block_reason)
                 monitoring_targets[ticker] = {
                     'target': current_price, 'status': 'blocked', 'buys': 0,
                     'exchange': exchange, 'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
@@ -1523,7 +1656,7 @@ def job():
                 }
                 continue
 
-            # Step 2: 무조건 매수 실행!
+            # Step 2: 게이트를 모두 통과한 경우에만 매수 실행
             qty = calculate_dca_quantity(available_cash, current_price, num_active_targets, DCA_SETTINGS, market,
                                          weight=ticker_weights.get(ticker, 1.0))
             if qty <= 0:
@@ -1546,6 +1679,7 @@ def job():
             if res and res.get('rt_cd') == '0':
                 logger.info(f"[{ticker}] ✅ 공격적 DCA 매수 성공! {qty}주")
                 send_alert(f"🚀 [{ticker}] 공격적 DCA 매수 성공! {qty}주 @ {currency}{current_price:,.2f}")
+                session_buy_count += 1
                 monitoring_targets[ticker] = {
                     'target': current_price, 'status': 'bought', 'buys': qty,
                     'exchange': exchange,
@@ -1775,15 +1909,16 @@ def job():
         logger.info(f"[{market}] No targets found for today. Sleeping.")
         return
 
-    # === [NEW] 포트폴리오 드로다운 체크 ===
+    # === 포트폴리오 드로다운 재확인 (진입 루프 이후 최신 잔고 기준으로 플래그 갱신) ===
+    # 최초 알림은 위 pre-check에서 이미 발송했으므로 여기서는 조용히 플래그만 갱신한다
+    # (감시 루프의 물타기/재진입 로직이 최신 상태를 참조할 수 있도록).
     try:
         holdings_for_check = []
         if balance and 'output1' in balance:
             holdings_for_check = balance['output1']
-        is_drawdown, total_loss_pct = check_portfolio_drawdown(holdings_for_check, PORTFOLIO_DRAWDOWN_PCT)
-        if is_drawdown:
-            logger.critical(f"🚨 PORTFOLIO DRAWDOWN ALERT! 전체 포트폴리오 손실 {total_loss_pct:.1f}% (기준: {PORTFOLIO_DRAWDOWN_PCT}%)")
-            send_alert(f"🚨 포트폴리오 드로다운 경고! 전체 손실 {total_loss_pct:.1f}%. 신규 매수 중단.")
+        portfolio_drawdown_halt, total_loss_pct = check_portfolio_drawdown(holdings_for_check, PORTFOLIO_DRAWDOWN_PCT)
+        if portfolio_drawdown_halt:
+            logger.warning(f"🚨 [재확인] 포트폴리오 드로다운 지속 중: {total_loss_pct:.1f}% (기준 {PORTFOLIO_DRAWDOWN_PCT}%) — 물타기/재진입 차단 유지")
     except Exception as e:
         logger.error(f"Portfolio drawdown check failed: {e}")
 
@@ -2238,16 +2373,22 @@ def job():
 
                 # === [v4.0] Aggressive DCA: 장중 물타기 (Averaging Down) ===
                 # 리스크 관리(손절/트레일링) 통과 후, 보유 종목이 하락 중이면 물타기
-                if STRATEGY_MODE == 'aggressive_dca' and AGG_DCA_AVG_DOWN_ENABLED:
+                if (STRATEGY_MODE == 'aggressive_dca' and AGG_DCA_AVG_DOWN_ENABLED
+                        and not portfolio_drawdown_halt):
                     try:
                         avg_down_count = data.get('avg_down_count', 0)
                         if avg_down_count < AGG_DCA_AVG_DOWN_MAX:
                             now_dt = datetime.datetime.now()
                             last_attempt = data.get('last_dca_attempt_at')
                             if not last_attempt or (now_dt - last_attempt).total_seconds() >= (DCA_REENTRY_INTERVAL_MIN * 60):
+                                # [v5.0] 섹터 악재 종목에는 물타기 금지 — 붕괴 중인 섹터에
+                                # 추가로 자금을 투입하는 것을 막는다.
+                                _sec_blocked, _sec_reason = check_sector_news_veto(ticker)
+                                if _sec_blocked:
+                                    logger.info(f"[{ticker}] 물타기 보류 - {_sec_reason}")
                                 _exchange = data.get('exchange')
                                 _buy_price = data.get('buy_price', 0)
-                                if _buy_price > 0:
+                                if not _sec_blocked and _buy_price > 0:
                                     if market == 'US':
                                         _ws_p = WS_PRICES.get(ticker, 0.0)
                                         _curr = _ws_p if _ws_p > 0 else safe_float(kis.get_current_price(ticker, _exchange) or 0)
@@ -2277,6 +2418,7 @@ def job():
                                                     available_cash -= (_qty * _curr)
                                                     logger.info(f"[{ticker}] ✅ 물타기 성공! 평단가: {_currency}{_blend:,.2f} ({_total}주)")
                                                     send_alert(f"📉 [{ticker}] 물타기 {_qty}주 @ {_currency}{_curr:,.2f}\n평단가: {_currency}{_blend:,.2f}")
+                                                    session_buy_count += 1
                                                 else:
                                                     data['last_dca_attempt_at'] = now_dt
                                                     logger.error(f"[{ticker}] ❌ 물타기 실패: {_res}")
@@ -2564,7 +2706,7 @@ def job():
     sold_sl = [t for t, d in monitoring_targets.items() if d['status'] == 'sold_sl']
     sold_tp = [t for t, d in monitoring_targets.items() if d['status'] == 'sold_tp']
     holding = [t for t, d in monitoring_targets.items() if d['status'] == 'bought']
-    logger.info(f"[{market}] Session summary ({STRATEGY_MODE.upper()}):")
+    logger.info(f"[{market}] Session summary ({STRATEGY_MODE.upper()}): buys={session_buy_count}")
     logger.info(f"   - 손절매: {sold_sl}")
     logger.info(f"   - 트레일링 스탑: {sold_tp}")
     logger.info(f"   - 계속 보유: {holding}")
@@ -2572,11 +2714,21 @@ def job():
         logger.info(f"   - 매수 보류/차단: {skipped_buy_reasons}")
     if sold_sl or sold_tp or skipped_buy_reasons:
         send_alert(
-            f"📊 [{market}] 세션 종료\n"
+            f"📊 [{market}] 세션 종료 (매수 {session_buy_count}건)\n"
             f"손절: {sold_sl}\n"
             f"익절: {sold_tp}\n"
             f"보유: {holding}\n"
             f"매수보류: {skipped_buy_reasons}"
+        )
+
+    # [v5.0] 매수 0건 워치독 — 과거 "미국장이 몇 주째 거래가 안 된다" 사고처럼,
+    # 매수 후보 종목은 있었는데 실제 체결이 하나도 없는 세션이 조용히 반복되는
+    # 상황을 알림 없이 넘기지 않기 위한 최소한의 자가 점검.
+    if session_buy_count == 0 and tickers and not holding:
+        logger.warning(f"[{market}] ⚠️ 이번 세션 매수 0건 (후보 {len(tickers)}개). skip 사유: {skipped_buy_reasons}")
+        send_alert(
+            f"⚠️ [{market}] 이번 세션 매수가 0건입니다 (후보 {len(tickers)}개, 기존 보유 없음).\n"
+            f"매수 보류 사유: {skipped_buy_reasons or '기록된 사유 없음 — 잔고/API 응답을 확인하세요.'}"
         )
 
 def run_with_recovery():
