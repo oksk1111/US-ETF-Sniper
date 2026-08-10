@@ -119,38 +119,47 @@ class KisDomestic:
         }
         
         res = self._request("GET", path, headers=headers, params=params)
-        if res and res['rt_cd'] == '0':
-            val = res['output'].get('stck_prpr', '')
-            if val and val != '':
-                return float(val)
+        try:
+            if res and res['rt_cd'] == '0':
+                val = res['output'].get('stck_prpr', '')
+                if val and val != '':
+                    return float(val)
+        except Exception as e:
+            # [v5.1] 예상치 못한 응답 형태(KeyError 등)로 호출부(run_bot.py 세션
+            # 루프)까지 예외가 전파되어 전체 세션이 죽는 사고를 막는다.
+            print(f"[KIS-KR] get_current_price parse error [{ticker}]: {e}")
         return None
 
     def get_daily_ohlc(self, ticker):
         """국내주식 기간별 시세 (일봉) - FHKST01010400"""
         path = "/uapi/domestic-stock/v1/quotations/inquire-daily-price"
         headers = self._get_headers("FHKST01010400")
-        
+
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_INPUT_ISCD": ticker,
             "FID_PERIOD_DIV_CODE": "D",
             "FID_ORG_ADJ_PRC": "1" # 수정주가 반영
         }
-        
+
         res = self._request("GET", path, headers=headers, params=params)
-        if res and res['rt_cd'] == '0':
-            # Format to match strategies expectations: [{'clos': '100', ...}]
-            # API returns stck_clpr (close), stck_oprc (open), etc.
-            output_list = []
-            for item in res['output']:
-                output_list.append({
-                    'clos': item['stck_clpr'],
-                    'open': item['stck_oprc'],
-                    'high': item['stck_hgpr'],
-                    'low': item['stck_lwpr'],
-                    'tvol': item.get('acml_vol', '0')
-                })
-            return output_list
+        try:
+            if res and res['rt_cd'] == '0':
+                # Format to match strategies expectations: [{'clos': '100', ...}]
+                # API returns stck_clpr (close), stck_oprc (open), etc.
+                output_list = []
+                for item in res['output']:
+                    output_list.append({
+                        'clos': item['stck_clpr'],
+                        'open': item['stck_oprc'],
+                        'high': item['stck_hgpr'],
+                        'low': item['stck_lwpr'],
+                        'tvol': item.get('acml_vol', '0')
+                    })
+                return output_list
+        except Exception as e:
+            # [v5.1] 위와 동일 - 종목 하나의 파싱 오류로 세션 전체가 죽지 않도록.
+            print(f"[KIS-KR] get_daily_ohlc parse error [{ticker}]: {e}")
         return None
 
     def get_balance(self):

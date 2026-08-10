@@ -165,16 +165,21 @@ class KisOverseas:
         
         # Use Rate Limited Request
         res = self._request("GET", path, headers=headers, params=params)
-        
-        if res and res['rt_cd'] == '0':
-            last = res['output'].get('last', '')
-            val = _safe_float(last)
-            if val > 0:
-                return val
-            return None
-        
-        if res:
-            print(f"[KIS] Current Price Error: {res.get('msg1')} (Code: {res.get('msg_cd')})")
+
+        try:
+            if res and res['rt_cd'] == '0':
+                last = res['output'].get('last', '')
+                val = _safe_float(last)
+                if val > 0:
+                    return val
+                return None
+
+            if res:
+                print(f"[KIS] Current Price Error: {res.get('msg1')} (Code: {res.get('msg_cd')})")
+        except Exception as e:
+            # [v5.1] 예상치 못한 응답 형태(KeyError 등)로 호출부(run_bot.py 세션
+            # 루프)까지 예외가 전파되어 전체 세션이 죽는 사고를 막는다.
+            print(f"[KIS] get_current_price parse error [{ticker}]: {e}")
         return None
 
     def get_quote(self, ticker, exchange="NAS"):

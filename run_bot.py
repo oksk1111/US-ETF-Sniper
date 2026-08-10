@@ -43,6 +43,7 @@ MAX_RETRIES_PER_TICKER = 3  # Maximum buy retries per ticker per session
 FAILED_TICKERS = set()  # Track permanently failed tickers (account restrictions)
 LEVERAGE_THRESHOLD_KRW = 10_000_000  # 1000만원 기준 (KR 시장만 적용)
 DYNAMIC_TARGETS = [] # Found by scanner
+KST = pytz.timezone('Asia/Seoul')  # 일일 상태 리셋 등에서 공용으로 사용 (이전에는 미정의라 NameError→fallback 이었음)
 
 # === Risk Management Constants ===
 STOP_LOSS_PCT = -3.0          # 손절매 기준 (%)
@@ -1034,6 +1035,36 @@ def job():
     # (알림 없이) 방치하지 않기 위한 최소한의 자가 점검 장치.
     session_buy_count = 0
 
+    # [v5.1] 당일 손절/청산 종목 재매수 금지 가드용 — monitoring_targets는 프로세스
+    # 재시작 시 메모리에서 통째로 사라지므로(sold_sl 등 상태 소실), 디스크에 남는
+    # trade_journal을 대신 조회한다. "13,455원 손절 → 몇 분 뒤 13,510원 즉시 재매수"
+    # 같은 휩쏘가 세션 크래시/재시작 직후에 실제로 발생했다 (2026-08-11 보고).
+    def _tickers_stopped_out_today():
+        try:
+            today = datetime.datetime.now(KST).strftime('%Y-%m-%d')
+        except Exception:
+            today = datetime.datetime.now().strftime('%Y-%m-%d')
+        stopped = set()
+        try:
+            for rec in trade_journal.load_journal():
+                if rec.get('market') != market:
+                    continue
+                exit_time = rec.get('exit_time') or ''
+                if not exit_time.startswith(today):
+                    continue
+                # already_flat + sold_qty=0 은 "외부에서 이미 청산돼 있었음"을 기록한
+                # 것일 뿐 우리가 손절매도를 실행한 것이 아니므로 가드 대상에서 제외.
+                if rec.get('phase') == 'already_flat' and not rec.get('sold_qty'):
+                    continue
+                stopped.add(str(rec.get('ticker')))
+        except Exception as _e:
+            logger.warning(f"[재매수가드] trade_journal 조회 실패 (가드 스킵): {_e}")
+        return stopped
+
+    STOPPED_OUT_TODAY = _tickers_stopped_out_today()
+    if STOPPED_OUT_TODAY:
+        logger.info(f"[{market}] 금일 이미 손절/청산되어 재매수 금지 대상: {sorted(STOPPED_OUT_TODAY)}")
+
     def record_skip_reason(ticker, reason):
         """매수 보류/차단 사유 추적"""
         if not ticker or not reason:
@@ -1447,397 +1478,327 @@ def job():
 
     # 1. Initialize Targets for each ticker
     for t_obj in tickers:
-        if isinstance(t_obj, dict):
-            ticker = t_obj.get('symbol') or t_obj.get('code')
-            # exchange 가 누락되면 (동적 포트폴리오의 symbol/weight 포맷 등) US_EXCHANGE_MAP 으로 보정
-            exchange = t_obj.get('exchange')
-            if not exchange and market == 'US':
-                exchange = _resolve_us_exchange(ticker)
-        else:
-            ticker = t_obj
-            exchange = _resolve_us_exchange(t_obj) if market == 'US' else None
-        if not ticker:
-            logger.warning(f"Skipping ticker entry with no symbol: {t_obj}")
-            continue
-
-        # 비중 추출 (dict 항목에만 weight 존재; 없으면 1.0)
         try:
-            ticker_weights[ticker] = float(t_obj.get('weight', 1.0)) if isinstance(t_obj, dict) else 1.0
-        except (TypeError, ValueError):
-            ticker_weights[ticker] = 1.0
+            if isinstance(t_obj, dict):
+                ticker = t_obj.get('symbol') or t_obj.get('code')
+                # exchange 가 누락되면 (동적 포트폴리오의 symbol/weight 포맷 등) US_EXCHANGE_MAP 으로 보정
+                exchange = t_obj.get('exchange')
+                if not exchange and market == 'US':
+                    exchange = _resolve_us_exchange(ticker)
+            else:
+                ticker = t_obj
+                exchange = _resolve_us_exchange(t_obj) if market == 'US' else None
+            if not ticker:
+                logger.warning(f"Skipping ticker entry with no symbol: {t_obj}")
+                continue
 
-        logger.info(f"Analyzing {ticker}...")
+            # 비중 추출 (dict 항목에만 weight 존재; 없으면 1.0)
+            try:
+                ticker_weights[ticker] = float(t_obj.get('weight', 1.0)) if isinstance(t_obj, dict) else 1.0
+            except (TypeError, ValueError):
+                ticker_weights[ticker] = 1.0
+
+            logger.info(f"Analyzing {ticker}...")
         
-        # A. Trend Check (20MA)
-        if market == 'US':
-            ohlc = kis.get_daily_ohlc(ticker, exchange)
-        else:
-            ohlc = kis.get_daily_ohlc(ticker)
+            # A. Trend Check (20MA)
+            if market == 'US':
+                ohlc = kis.get_daily_ohlc(ticker, exchange)
+            else:
+                ohlc = kis.get_daily_ohlc(ticker)
             
-        if not ohlc:
-            logger.error(f"[{ticker}] Failed to get OHLC. Skipping.")
-            continue
+            if not ohlc:
+                logger.error(f"[{ticker}] Failed to get OHLC. Skipping.")
+                continue
 
-        closes = [safe_float(x['clos']) for x in ohlc]
-        closes.reverse() 
+            closes = [safe_float(x['clos']) for x in ohlc]
+            closes.reverse() 
         
-        ma20 = calculate_ma(closes, 20)
+            ma20 = calculate_ma(closes, 20)
         
-        if market == 'US':
-            current_price = kis.get_current_price(ticker, exchange)
-        else:
-            current_price = kis.get_current_price(ticker)
+            if market == 'US':
+                current_price = kis.get_current_price(ticker, exchange)
+            else:
+                current_price = kis.get_current_price(ticker)
         
-        if not current_price:
-             logger.error(f"[{ticker}] Failed to get Current Price. Skipping.")
-             continue
+            if not current_price:
+                 logger.error(f"[{ticker}] Failed to get Current Price. Skipping.")
+                 continue
 
-        logger.info(f"[{ticker}] Current: {current_price}, MA20: {ma20}")
+            logger.info(f"[{ticker}] Current: {current_price}, MA20: {ma20}")
         
-        # --- 시장/종목별 리스크 파라미터 결정 ---
-        is_kr_stock = (market == 'KR' and ticker not in KR_ETF_CODES)
-        if is_kr_stock:
-            eff_stop_loss = KR_STOCK_STOP_LOSS_PCT
-            eff_trailing_activation = KR_STOCK_TRAILING_ACTIVATION
-            eff_trailing_drop = KR_STOCK_TRAILING_DROP
-            eff_gap_down_threshold = KR_STOCK_GAP_DOWN_THRESHOLD
-        else:
-            eff_stop_loss = STOP_LOSS_PCT
-            eff_trailing_activation = TRAILING_STOP_ACTIVATION
-            eff_trailing_drop = TRAILING_STOP_DROP
-            eff_gap_down_threshold = GAP_DOWN_THRESHOLD
+            # --- 시장/종목별 리스크 파라미터 결정 ---
+            is_kr_stock = (market == 'KR' and ticker not in KR_ETF_CODES)
+            if is_kr_stock:
+                eff_stop_loss = KR_STOCK_STOP_LOSS_PCT
+                eff_trailing_activation = KR_STOCK_TRAILING_ACTIVATION
+                eff_trailing_drop = KR_STOCK_TRAILING_DROP
+                eff_gap_down_threshold = KR_STOCK_GAP_DOWN_THRESHOLD
+            else:
+                eff_stop_loss = STOP_LOSS_PCT
+                eff_trailing_activation = TRAILING_STOP_ACTIVATION
+                eff_trailing_drop = TRAILING_STOP_DROP
+                eff_gap_down_threshold = GAP_DOWN_THRESHOLD
         
-        # --- STRATEGY BRANCHING ---
-        is_uptrend = check_trend(current_price, ma20)
+            # --- STRATEGY BRANCHING ---
+            is_uptrend = check_trend(current_price, ma20)
         
-        # === [NEW] 단기 이동평균 (5MA) - 급락 조기 감지 ===
-        ma5 = calculate_short_ma(closes, 5)
-        is_short_uptrend = check_trend(current_price, ma5) if ma5 else True
+            # === [NEW] 단기 이동평균 (5MA) - 급락 조기 감지 ===
+            ma5 = calculate_short_ma(closes, 5)
+            is_short_uptrend = check_trend(current_price, ma5) if ma5 else True
         
-        # === [NEW] 갭다운 감지 - 전일 종가 대비 급락 체크 ===
-        is_gap_down, gap_drop_pct = check_gap_down(current_price, ohlc, eff_gap_down_threshold)
-        if is_gap_down:
-            logger.warning(f"[{ticker}] ⚠️ GAP DOWN detected! ({gap_drop_pct:.1f}% drop from prev close)")
-            send_alert(f"⚠️ [{ticker}] 갭다운 감지! 전일 대비 {gap_drop_pct:.1f}% 급락")
+            # === [NEW] 갭다운 감지 - 전일 종가 대비 급락 체크 ===
+            is_gap_down, gap_drop_pct = check_gap_down(current_price, ohlc, eff_gap_down_threshold)
+            if is_gap_down:
+                logger.warning(f"[{ticker}] ⚠️ GAP DOWN detected! ({gap_drop_pct:.1f}% drop from prev close)")
+                send_alert(f"⚠️ [{ticker}] 갭다운 감지! 전일 대비 {gap_drop_pct:.1f}% 급락")
         
-        # === [NEW] 연속 하락 감지 ===
-        is_consecutive_decline, cum_drop_pct = check_consecutive_decline(
-            ohlc, CONSECUTIVE_DECLINE_DAYS, CONSECUTIVE_DECLINE_PCT
-        )
-        if is_consecutive_decline:
-            logger.warning(f"[{ticker}] ⚠️ CONSECUTIVE DECLINE! ({cum_drop_pct:.1f}% over {CONSECUTIVE_DECLINE_DAYS} days)")
-            send_alert(f"⚠️ [{ticker}] {CONSECUTIVE_DECLINE_DAYS}일 연속 하락! 누적 {cum_drop_pct:.1f}%")
+            # === [NEW] 연속 하락 감지 ===
+            is_consecutive_decline, cum_drop_pct = check_consecutive_decline(
+                ohlc, CONSECUTIVE_DECLINE_DAYS, CONSECUTIVE_DECLINE_PCT
+            )
+            if is_consecutive_decline:
+                logger.warning(f"[{ticker}] ⚠️ CONSECUTIVE DECLINE! ({cum_drop_pct:.1f}% over {CONSECUTIVE_DECLINE_DAYS} days)")
+                send_alert(f"⚠️ [{ticker}] {CONSECUTIVE_DECLINE_DAYS}일 연속 하락! 누적 {cum_drop_pct:.1f}%")
 
-        # === [v4.0] Aggressive DCA 전략 — 무조건 분할매수 + 엄격한 리스크 관리 ===
-        if STRATEGY_MODE == 'aggressive_dca':
-            # Step 0: 기존 보유분 → 손절 체크만 수행
-            if ticker in current_holdings:
-                holding_qty = 0
-                holding_avg_price = 0
-                try:
-                    for h in balance.get('output1', []):
-                        if h.get('pdno') == ticker or h.get('ovrs_pdno') == ticker:
-                            holding_qty = int(safe_float(h.get('hldg_qty', h.get('ovrs_cblc_qty', h.get('ord_psbl_qty', '0')))))
-                            holding_avg_price = safe_float(h.get('pchs_avg_pric', h.get('avg_unpr3', 0)))
-                            break
-                except:
-                    pass
+            # === [v4.0] Aggressive DCA 전략 — 무조건 분할매수 + 엄격한 리스크 관리 ===
+            if STRATEGY_MODE == 'aggressive_dca':
+                # Step 0: 기존 보유분 → 손절 체크만 수행
+                if ticker in current_holdings:
+                    holding_qty = 0
+                    holding_avg_price = 0
+                    try:
+                        for h in balance.get('output1', []):
+                            if h.get('pdno') == ticker or h.get('ovrs_pdno') == ticker:
+                                holding_qty = int(safe_float(h.get('hldg_qty', h.get('ovrs_cblc_qty', h.get('ord_psbl_qty', '0')))))
+                                holding_avg_price = safe_float(h.get('pchs_avg_pric', h.get('avg_unpr3', 0)))
+                                break
+                    except:
+                        pass
 
-                if holding_qty <= 0:
-                    logger.info(f"[{ticker}] 보유 수량 0, 스킵")
-                    continue
-
-                if holding_avg_price > 0 and current_price > 0:
-                    pnl_pct = ((current_price - holding_avg_price) / holding_avg_price) * 100
-                    logger.info(f"[{ticker}] 📊 보유: {holding_qty}주, 평단가: {holding_avg_price:.2f}, 현재가: {current_price:.2f}, 손익: {pnl_pct:.2f}%")
-
-                    # 손절매 체크
-                    if pnl_pct <= eff_stop_loss:
-                        logger.warning(f"[{ticker}] 🛑 STOP LOSS! ({pnl_pct:.2f}% <= {eff_stop_loss}%). {holding_qty}주 매도.")
-                        send_alert(f"🛑 [{ticker}] 손절매! {pnl_pct:.2f}%. {holding_qty}주 매도.")
-                        _sl = safe_sell(kis, market, ticker, holding_qty, exchange,
-                                        reason='손절매', monitor_data=monitoring_targets.get(ticker))
-                        if _sl['phase'] == 'deferred':
-                            continue
-                        if _sl['success'] or _sl['phase'] == 'already_flat':
-                            monitoring_targets[ticker] = {'target': current_price, 'status': 'sold_sl', 'buys': 0, 'exchange': exchange}
-                        else:
-                            monitoring_targets[ticker] = {'target': current_price, 'status': 'stop_loss_failed',
-                                                          'buys': holding_qty, 'exchange': exchange,
-                                                          'buy_price': holding_avg_price, 'stop_loss_fail_count': 1}
+                    if holding_qty <= 0:
+                        logger.info(f"[{ticker}] 보유 수량 0, 스킵")
                         continue
 
-                # 보유 종목 → 모니터링 등록 (물타기 대상)
-                monitoring_targets[ticker] = {
-                    'target': current_price, 'status': 'bought', 'buys': holding_qty,
-                    'exchange': exchange,
-                    'buy_price': holding_avg_price if holding_avg_price > 0 else current_price,
-                    'highest_price': current_price,
-                    'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
-                    'dca_buys_this_session': 0, 'avg_down_count': 0,
-                    'last_dca_attempt_at': None,
-                    'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
-                }
-                continue
+                    if holding_avg_price > 0 and current_price > 0:
+                        pnl_pct = ((current_price - holding_avg_price) / holding_avg_price) * 100
+                        logger.info(f"[{ticker}] 📊 보유: {holding_qty}주, 평단가: {holding_avg_price:.2f}, 현재가: {current_price:.2f}, 손익: {pnl_pct:.2f}%")
 
-            # Step 1: 신규 매수 — v5.0부터 게이트를 전부 복원 (묻지마 매수 폐지)
-            buy_blocked = False
-            block_reason = ""
+                        # 손절매 체크
+                        if pnl_pct <= eff_stop_loss:
+                            logger.warning(f"[{ticker}] 🛑 STOP LOSS! ({pnl_pct:.2f}% <= {eff_stop_loss}%). {holding_qty}주 매도.")
+                            send_alert(f"🛑 [{ticker}] 손절매! {pnl_pct:.2f}%. {holding_qty}주 매도.")
+                            _sl = safe_sell(kis, market, ticker, holding_qty, exchange,
+                                            reason='손절매', monitor_data=monitoring_targets.get(ticker))
+                            if _sl['phase'] == 'deferred':
+                                continue
+                            if _sl['success'] or _sl['phase'] == 'already_flat':
+                                monitoring_targets[ticker] = {'target': current_price, 'status': 'sold_sl', 'buys': 0, 'exchange': exchange}
+                            else:
+                                monitoring_targets[ticker] = {'target': current_price, 'status': 'stop_loss_failed',
+                                                              'buys': holding_qty, 'exchange': exchange,
+                                                              'buy_price': holding_avg_price, 'stop_loss_fail_count': 1}
+                            continue
 
-            # (1) 패닉 갭다운 (>8%) — 하루 대기
-            if is_gap_down and gap_drop_pct >= AGG_DCA_PANIC_GAP:
-                buy_blocked = True
-                block_reason = f"패닉 갭다운 {gap_drop_pct:.1f}% (>{AGG_DCA_PANIC_GAP}%)"
-
-            # (2) 가용 현금 부족
-            if not buy_blocked and available_cash < current_price:
-                buy_blocked = True
-                block_reason = f"자금 부족 (현금 {available_cash:.0f} < 1주 {current_price:.0f})"
-
-            # (3) 포트폴리오 드로다운 서킷브레이커
-            if not buy_blocked and portfolio_drawdown_halt:
-                buy_blocked = True
-                block_reason = f"포트폴리오 드로다운 {PORTFOLIO_DRAWDOWN_PCT}% 초과 — 신규 매수 전면 중단"
-
-            # (4) 추세 이탈 — 레버리지는 10MA, 일반은 20MA 기준
-            if not buy_blocked and not AGG_DCA_SKIP_TREND:
-                is_lev = (market == 'US' and ticker in US_LEVERAGED_ETF_SYMBOLS) or ticker in LEVERAGED_ETF_FACTOR
-                if is_lev and len(ohlc) >= 10:
-                    _ma10 = calculate_ma([safe_float(x['clos']) for x in reversed(ohlc)], 10)
-                    trend_ok_buy = check_trend(current_price, _ma10) if _ma10 else is_uptrend
-                else:
-                    trend_ok_buy = is_uptrend
-                # KR 시장은 도메스틱 수급 변동성이 커서 5MA까지 함께 확인 (더 엄격한 확인)
-                if market == 'KR' and trend_ok_buy:
-                    trend_ok_buy = is_short_uptrend
-                if not trend_ok_buy:
-                    buy_blocked = True
-                    block_reason = "추세 이탈 (MA 하회) — 신규 매수 보류"
-
-            # (5) 상관 그룹 한도 — 같은 섹터/지수 그룹 동시 보유 제한
-            if not buy_blocked and not AGG_DCA_SKIP_CORR:
-                _capped, _grp = is_correlation_capped(ticker, monitoring_targets)
-                if _capped:
-                    buy_blocked = True
-                    block_reason = f"상관그룹 한도 초과 (group={_grp})"
-
-            # (6) 일일 손실 누적 서킷브레이커
-            if not buy_blocked and is_losing_streak_pause():
-                buy_blocked = True
-                block_reason = "일일 손실 한도 초과 — 신규 매수 중단"
-
-            # (7) 시장 전반 AI 뉴스 veto (기존 v4.0에서 꺼져 있던 것을 복원)
-            if not buy_blocked and not AGG_DCA_SKIP_AI:
-                try:
-                    _news = ai.fetch_news()
-                    _sent = ai.check_market_sentiment(_news, persona=PERSONA)
-                    if _sent.get('market_condition') == 'CRASH' or _sent.get('risk_level') == 'HIGH':
-                        buy_blocked = True
-                        block_reason = f"AI 시장 위험 감지: {_sent.get('reason', 'N/A')[:80]}"
-                except Exception as _ai_e:
-                    logger.error(f"[{ticker}] AI 시장 체크 실패 (안전을 위해 계속 진행): {_ai_e}")
-
-            # (8) [v5.0 신규] 섹터 특화 뉴스 veto — 반도체 등 특정 섹터 악재 시 해당
-            # 섹터 종목만 차단. 2026-07 반도체 붕괴 국면에서 SOXL/SMH를 뉴스 무시하고
-            # 계속 매수했던 사고의 직접적인 재발 방지책.
-            if not buy_blocked:
-                _sec_blocked, _sec_reason = check_sector_news_veto(ticker)
-                if _sec_blocked:
-                    buy_blocked = True
-                    block_reason = _sec_reason
-
-            if buy_blocked:
-                logger.info(f"[{ticker}] ⛔ 매수 차단: {block_reason}")
-                record_skip_reason(ticker, block_reason)
-                monitoring_targets[ticker] = {
-                    'target': current_price, 'status': 'blocked', 'buys': 0,
-                    'exchange': exchange, 'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
-                    'block_reason': block_reason,
-                }
-                continue
-
-            # Step 2: 게이트를 모두 통과한 경우에만 매수 실행
-            qty = calculate_dca_quantity(available_cash, current_price, num_active_targets, DCA_SETTINGS, market,
-                                         weight=ticker_weights.get(ticker, 1.0))
-            if qty <= 0:
-                logger.info(f"[{ticker}] 매수 수량 0 (투자금액 부족)")
-                monitoring_targets[ticker] = {
-                    'target': current_price, 'status': 'dca_wait', 'buys': 0,
-                    'exchange': exchange, 'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
-                    'dca_buys_this_session': 0, 'last_dca_attempt_at': None,
-                    'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
-                }
-                continue
-
-            currency = "$" if market == 'US' else "₩"
-            logger.info(f"[{ticker}] 🚀 공격적 DCA 매수: {qty}주 @ {currency}{current_price:,.2f}")
-            if market == 'US':
-                res = kis.buy_market_order(ticker, qty, exchange)
-            else:
-                res = kis.buy_market_order(ticker, qty)
-
-            if res and res.get('rt_cd') == '0':
-                logger.info(f"[{ticker}] ✅ 공격적 DCA 매수 성공! {qty}주")
-                send_alert(f"🚀 [{ticker}] 공격적 DCA 매수 성공! {qty}주 @ {currency}{current_price:,.2f}")
-                session_buy_count += 1
-                monitoring_targets[ticker] = {
-                    'target': current_price, 'status': 'bought', 'buys': qty,
-                    'exchange': exchange,
-                    'buy_price': current_price, 'highest_price': current_price,
-                    'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
-                    'entry_time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'dca_buys_this_session': 1, 'avg_down_count': 0,
-                    'last_dca_attempt_at': datetime.datetime.now(),
-                    'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
-                }
-                # 현금 차감 (다음 종목 수량 계산에 반영)
-                available_cash -= (qty * current_price)
-            else:
-                err_msg = res.get('msg1', 'unknown') if res else 'no response'
-                logger.error(f"[{ticker}] ❌ 매수 실패: {err_msg}")
-                if res and res.get('msg_cd') in ['APBK1680', 'APBK1681']:
-                    FAILED_TICKERS.add(ticker)
-                monitoring_targets[ticker] = {
-                    'target': current_price, 'status': 'dca_wait', 'buys': 0,
-                    'exchange': exchange, 'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
-                    'dca_buys_this_session': 0, 'last_dca_attempt_at': datetime.datetime.now(),
-                    'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
-                }
-            continue
-
-        # DCA 전략 (기존 — 조건부 매수)
-        if STRATEGY_MODE == 'dca':
-            # === [NEW] Step 0: 기존 보유분 리스크 체크 (DCA도 반드시 실행) ===
-            if ticker in current_holdings:
-                holding_qty = 0
-                holding_avg_price = 0
-                try:
-                    for h in balance.get('output1', []):
-                        if h.get('pdno') == ticker or h.get('ovrs_pdno') == ticker:  # h.get() 사용 (KeyError 방지)
-                            holding_qty = int(safe_float(h.get('hldg_qty', h.get('ovrs_cblc_qty', h.get('ord_psbl_qty', '0')))))
-                            holding_avg_price = safe_float(h.get('pchs_avg_pric', h.get('avg_unpr3', 0)))
-                            break
-                except:
-                    pass
-
-                # 실제 보유 수량이 0이면 skip (KIS API가 매도 후에도 qty=0으로 반환하는 경우 대비)
-                if holding_qty <= 0:
-                    logger.info(f"[{ticker}] 보유 수량 0, 매도 스킵 (이미 매도된 종목)")
+                    # 보유 종목 → 모니터링 등록 (물타기 대상)
+                    monitoring_targets[ticker] = {
+                        'target': current_price, 'status': 'bought', 'buys': holding_qty,
+                        'exchange': exchange,
+                        'buy_price': holding_avg_price if holding_avg_price > 0 else current_price,
+                        'highest_price': current_price,
+                        'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
+                        'dca_buys_this_session': 0, 'avg_down_count': 0,
+                        'last_dca_attempt_at': None,
+                        'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
+                    }
                     continue
 
-                if holding_avg_price > 0 and current_price > 0:
-                    pnl_pct = ((current_price - holding_avg_price) / holding_avg_price) * 100
-                    logger.info(f"[{ticker}] 📊 보유현황: {holding_qty}주, 평단가: {holding_avg_price:.2f}, 현재가: {current_price:.2f}, 손익: {pnl_pct:.2f}%")
+                # Step 1: 신규 매수 — v5.0부터 게이트를 전부 복원 (묻지마 매수 폐지)
+                buy_blocked = False
+                block_reason = ""
 
-                    # Stop Loss - 시장/종목별 차별화 (KR 개별주는 완화)
-                    if pnl_pct <= eff_stop_loss:
-                        logger.warning(f"[{ticker}] 🛑 DCA STOP LOSS! ({pnl_pct:.2f}% <= {eff_stop_loss}%). 즉시 매도 {holding_qty}주.")
-                        send_alert(f"🛑 [{ticker}] DCA 손절매 발동! {pnl_pct:.2f}%. {holding_qty}주 매도.")
-                        _dca_sl = safe_sell(kis, market, ticker, holding_qty, exchange,
-                                            reason='DCA손절매',
-                                            monitor_data=monitoring_targets.get(ticker))
-                        if _dca_sl['phase'] == 'deferred':
-                            logger.info(f"[{ticker}] DCA 손절매 보류 (장 마감)")
-                            # 모니터링 상태는 그대로 두어 다음 사이클에서 재평가
-                            continue
-                        if _dca_sl['success'] or _dca_sl['phase'] == 'already_flat':
-                            monitoring_targets[ticker] = {
-                                'target': current_price, 'status': 'sold_sl',
-                                'buys': 0, 'exchange': exchange
-                            }
-                        else:
-                            logger.error(
-                                f"[{ticker}] ❌ DCA 손절매 실패: {_dca_sl['error']}"
-                            )
-                            send_alert(
-                                f"🚨 [{ticker}] DCA 손절매 실패! 수동 확인 필요.\n오류: {_dca_sl['error']}",
-                                is_error=True
-                            )
-                            monitoring_targets[ticker] = {
-                                'target': current_price, 'status': 'stop_loss_failed',
-                                'buys': holding_qty, 'exchange': exchange,
-                                'buy_price': holding_avg_price if holding_avg_price > 0 else current_price,
-                                'stop_loss_fail_count': 1
-                            }
-                        continue  # 손절 후 추가 매수 안 함
-                monitoring_targets[ticker] = {
-                    'target': current_price,
-                    'status': 'bought',
-                    'buys': holding_qty,
-                    'exchange': exchange,
-                    'buy_price': holding_avg_price if holding_avg_price > 0 else current_price,
-                    'highest_price': current_price,
-                    'ma20': ma20,
-                    'ma5': ma5,
-                    'ohlc': ohlc,
-                    'dca_buys_this_session': 0,
-                    'last_dca_attempt_at': None,
-                    'dca_reentry_interval_min': (
-                        DCA_LEVERAGED_REENTRY_INTERVAL_MIN if (market == 'US' and ticker in US_LEVERAGED_ETF_SYMBOLS)
-                        else DCA_REENTRY_INTERVAL_MIN
-                    )
-                }
-                continue  # 이미 보유 중인 종목은 리스크 관리만 수행
+                # (0) [v5.1] 금일 이미 손절/청산한 종목 → 당일 재매수 금지 (휩쏘 방지)
+                if ticker in STOPPED_OUT_TODAY:
+                    buy_blocked = True
+                    block_reason = "금일 이미 손절/청산 - 당일 재매수 금지 (휩쏘 방지 가드)"
 
-            prepare_dca_wait_target(ticker, exchange, current_price, ma20, ma5, ohlc)
-            attempt_dca_buy(ticker, exchange, current_price, ma20, ma5, ohlc, eff_gap_down_threshold, num_active_targets)
-            continue  # DCA는 주기적 재평가 대상으로 전환
-        
-        # Case 1: Already Holding
-        if ticker in current_holdings:
-            # 보유 수량 조회
-            holding_qty = 0
-            holding_avg_price = 0
-            try:
-                for h in balance.get('output1', []):
-                    if h.get('pdno') == ticker or h.get('ovrs_pdno') == ticker:
-                        holding_qty = int(safe_float(h.get('hldg_qty', h.get('ovrs_cblc_qty', '0'))))
-                        holding_avg_price = safe_float(h.get('pchs_avg_pric', h.get('avg_unpr3', 0)))
-                        break
-            except:
-                pass
+                # (1) 패닉 갭다운 (>8%) — 하루 대기
+                if is_gap_down and gap_drop_pct >= AGG_DCA_PANIC_GAP:
+                    buy_blocked = True
+                    block_reason = f"패닉 갭다운 {gap_drop_pct:.1f}% (>{AGG_DCA_PANIC_GAP}%)"
 
-            # 실제 보유 수량이 0이면 skip (current_holdings 필터를 통과했더라도 재확인)
-            if holding_qty <= 0:
-                logger.info(f"[{ticker}] 보유 수량 0, 매도 스킵 (이미 매도된 종목)")
+                # (2) 가용 현금 부족
+                if not buy_blocked and available_cash < current_price:
+                    buy_blocked = True
+                    block_reason = f"자금 부족 (현금 {available_cash:.0f} < 1주 {current_price:.0f})"
+
+                # (3) 포트폴리오 드로다운 서킷브레이커
+                if not buy_blocked and portfolio_drawdown_halt:
+                    buy_blocked = True
+                    block_reason = f"포트폴리오 드로다운 {PORTFOLIO_DRAWDOWN_PCT}% 초과 — 신규 매수 전면 중단"
+
+                # (4) 추세 이탈 — 레버리지는 10MA, 일반은 20MA 기준
+                if not buy_blocked and not AGG_DCA_SKIP_TREND:
+                    is_lev = (market == 'US' and ticker in US_LEVERAGED_ETF_SYMBOLS) or ticker in LEVERAGED_ETF_FACTOR
+                    if is_lev and len(ohlc) >= 10:
+                        _ma10 = calculate_ma([safe_float(x['clos']) for x in reversed(ohlc)], 10)
+                        trend_ok_buy = check_trend(current_price, _ma10) if _ma10 else is_uptrend
+                    else:
+                        trend_ok_buy = is_uptrend
+                    # KR 시장은 도메스틱 수급 변동성이 커서 5MA까지 함께 확인 (더 엄격한 확인)
+                    if market == 'KR' and trend_ok_buy:
+                        trend_ok_buy = is_short_uptrend
+                    if not trend_ok_buy:
+                        buy_blocked = True
+                        block_reason = "추세 이탈 (MA 하회) — 신규 매수 보류"
+
+                # (5) 상관 그룹 한도 — 같은 섹터/지수 그룹 동시 보유 제한
+                if not buy_blocked and not AGG_DCA_SKIP_CORR:
+                    _capped, _grp = is_correlation_capped(ticker, monitoring_targets)
+                    if _capped:
+                        buy_blocked = True
+                        block_reason = f"상관그룹 한도 초과 (group={_grp})"
+
+                # (6) 일일 손실 누적 서킷브레이커
+                if not buy_blocked and is_losing_streak_pause():
+                    buy_blocked = True
+                    block_reason = "일일 손실 한도 초과 — 신규 매수 중단"
+
+                # (7) 시장 전반 AI 뉴스 veto (기존 v4.0에서 꺼져 있던 것을 복원)
+                if not buy_blocked and not AGG_DCA_SKIP_AI:
+                    try:
+                        _news = ai.fetch_news()
+                        _sent = ai.check_market_sentiment(_news, persona=PERSONA)
+                        if _sent.get('market_condition') == 'CRASH' or _sent.get('risk_level') == 'HIGH':
+                            buy_blocked = True
+                            block_reason = f"AI 시장 위험 감지: {_sent.get('reason', 'N/A')[:80]}"
+                    except Exception as _ai_e:
+                        logger.error(f"[{ticker}] AI 시장 체크 실패 (안전을 위해 계속 진행): {_ai_e}")
+
+                # (8) [v5.0 신규] 섹터 특화 뉴스 veto — 반도체 등 특정 섹터 악재 시 해당
+                # 섹터 종목만 차단. 2026-07 반도체 붕괴 국면에서 SOXL/SMH를 뉴스 무시하고
+                # 계속 매수했던 사고의 직접적인 재발 방지책.
+                if not buy_blocked:
+                    _sec_blocked, _sec_reason = check_sector_news_veto(ticker)
+                    if _sec_blocked:
+                        buy_blocked = True
+                        block_reason = _sec_reason
+
+                if buy_blocked:
+                    logger.info(f"[{ticker}] ⛔ 매수 차단: {block_reason}")
+                    record_skip_reason(ticker, block_reason)
+                    monitoring_targets[ticker] = {
+                        'target': current_price, 'status': 'blocked', 'buys': 0,
+                        'exchange': exchange, 'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
+                        'block_reason': block_reason,
+                    }
+                    continue
+
+                # Step 2: 게이트를 모두 통과한 경우에만 매수 실행
+                qty = calculate_dca_quantity(available_cash, current_price, num_active_targets, DCA_SETTINGS, market,
+                                             weight=ticker_weights.get(ticker, 1.0))
+                if qty <= 0:
+                    logger.info(f"[{ticker}] 매수 수량 0 (투자금액 부족)")
+                    monitoring_targets[ticker] = {
+                        'target': current_price, 'status': 'dca_wait', 'buys': 0,
+                        'exchange': exchange, 'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
+                        'dca_buys_this_session': 0, 'last_dca_attempt_at': None,
+                        'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
+                    }
+                    continue
+
+                currency = "$" if market == 'US' else "₩"
+                logger.info(f"[{ticker}] 🚀 공격적 DCA 매수: {qty}주 @ {currency}{current_price:,.2f}")
+                if market == 'US':
+                    res = kis.buy_market_order(ticker, qty, exchange)
+                else:
+                    res = kis.buy_market_order(ticker, qty)
+
+                if res and res.get('rt_cd') == '0':
+                    logger.info(f"[{ticker}] ✅ 공격적 DCA 매수 성공! {qty}주")
+                    send_alert(f"🚀 [{ticker}] 공격적 DCA 매수 성공! {qty}주 @ {currency}{current_price:,.2f}")
+                    session_buy_count += 1
+                    monitoring_targets[ticker] = {
+                        'target': current_price, 'status': 'bought', 'buys': qty,
+                        'exchange': exchange,
+                        'buy_price': current_price, 'highest_price': current_price,
+                        'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
+                        'entry_time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'dca_buys_this_session': 1, 'avg_down_count': 0,
+                        'last_dca_attempt_at': datetime.datetime.now(),
+                        'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
+                    }
+                    # 현금 차감 (다음 종목 수량 계산에 반영)
+                    available_cash -= (qty * current_price)
+                else:
+                    err_msg = res.get('msg1', 'unknown') if res else 'no response'
+                    logger.error(f"[{ticker}] ❌ 매수 실패: {err_msg}")
+                    if res and res.get('msg_cd') in ['APBK1680', 'APBK1681']:
+                        FAILED_TICKERS.add(ticker)
+                    monitoring_targets[ticker] = {
+                        'target': current_price, 'status': 'dca_wait', 'buys': 0,
+                        'exchange': exchange, 'ma20': ma20, 'ma5': ma5, 'ohlc': ohlc,
+                        'dca_buys_this_session': 0, 'last_dca_attempt_at': datetime.datetime.now(),
+                        'dca_reentry_interval_min': DCA_REENTRY_INTERVAL_MIN,
+                    }
                 continue
 
-            if not is_uptrend and not is_short_uptrend:
-                logger.info(f"[{ticker}] Trend Broken (Price < 20MA and < 5MA). Selling {holding_qty} shares immediately.")
-                sell_res = None
-                for _attempt in range(3):
-                    if market == 'US':
-                        sell_res = kis.sell_market_order(ticker, holding_qty, exchange)
-                    else:
-                        sell_res = kis.sell_market_order(ticker, holding_qty)
-                    if sell_res and sell_res.get('rt_cd') == '0':
-                        break
-                    logger.warning(f"[{ticker}] Trend-break sell attempt {_attempt+1} failed: {sell_res}. Retrying...")
-                    time.sleep(2)
+            # DCA 전략 (기존 — 조건부 매수)
+            if STRATEGY_MODE == 'dca':
+                # === [NEW] Step 0: 기존 보유분 리스크 체크 (DCA도 반드시 실행) ===
+                if ticker in current_holdings:
+                    holding_qty = 0
+                    holding_avg_price = 0
+                    try:
+                        for h in balance.get('output1', []):
+                            if h.get('pdno') == ticker or h.get('ovrs_pdno') == ticker:  # h.get() 사용 (KeyError 방지)
+                                holding_qty = int(safe_float(h.get('hldg_qty', h.get('ovrs_cblc_qty', h.get('ord_psbl_qty', '0')))))
+                                holding_avg_price = safe_float(h.get('pchs_avg_pric', h.get('avg_unpr3', 0)))
+                                break
+                    except:
+                        pass
 
-                if sell_res and sell_res.get('rt_cd') == '0':
-                    logger.info(f"[{ticker}] ✅ Trend-break sell success.")
-                    today_open = safe_float(ohlc[0]['open'])
-                    reentry_target = calculate_target_price(today_open, ohlc, K_VALUE)
+                    # 실제 보유 수량이 0이면 skip (KIS API가 매도 후에도 qty=0으로 반환하는 경우 대비)
+                    if holding_qty <= 0:
+                        logger.info(f"[{ticker}] 보유 수량 0, 매도 스킵 (이미 매도된 종목)")
+                        continue
+
+                    if holding_avg_price > 0 and current_price > 0:
+                        pnl_pct = ((current_price - holding_avg_price) / holding_avg_price) * 100
+                        logger.info(f"[{ticker}] 📊 보유현황: {holding_qty}주, 평단가: {holding_avg_price:.2f}, 현재가: {current_price:.2f}, 손익: {pnl_pct:.2f}%")
+
+                        # Stop Loss - 시장/종목별 차별화 (KR 개별주는 완화)
+                        if pnl_pct <= eff_stop_loss:
+                            logger.warning(f"[{ticker}] 🛑 DCA STOP LOSS! ({pnl_pct:.2f}% <= {eff_stop_loss}%). 즉시 매도 {holding_qty}주.")
+                            send_alert(f"🛑 [{ticker}] DCA 손절매 발동! {pnl_pct:.2f}%. {holding_qty}주 매도.")
+                            _dca_sl = safe_sell(kis, market, ticker, holding_qty, exchange,
+                                                reason='DCA손절매',
+                                                monitor_data=monitoring_targets.get(ticker))
+                            if _dca_sl['phase'] == 'deferred':
+                                logger.info(f"[{ticker}] DCA 손절매 보류 (장 마감)")
+                                # 모니터링 상태는 그대로 두어 다음 사이클에서 재평가
+                                continue
+                            if _dca_sl['success'] or _dca_sl['phase'] == 'already_flat':
+                                monitoring_targets[ticker] = {
+                                    'target': current_price, 'status': 'sold_sl',
+                                    'buys': 0, 'exchange': exchange
+                                }
+                            else:
+                                logger.error(
+                                    f"[{ticker}] ❌ DCA 손절매 실패: {_dca_sl['error']}"
+                                )
+                                send_alert(
+                                    f"🚨 [{ticker}] DCA 손절매 실패! 수동 확인 필요.\n오류: {_dca_sl['error']}",
+                                    is_error=True
+                                )
+                                monitoring_targets[ticker] = {
+                                    'target': current_price, 'status': 'stop_loss_failed',
+                                    'buys': holding_qty, 'exchange': exchange,
+                                    'buy_price': holding_avg_price if holding_avg_price > 0 else current_price,
+                                    'stop_loss_fail_count': 1
+                                }
+                            continue  # 손절 후 추가 매수 안 함
                     monitoring_targets[ticker] = {
-                        'target': reentry_target,
-                        'status': 'reentry_watch',
-                        'buys': 0,
-                        'exchange': exchange,
-                        'ma20': ma20,
-                        'ma5': ma5,
-                        'ohlc': ohlc,
-                        'last_reentry_check_at': None,
-                        'reentry_cooldown_sec': TREND_REENTRY_COOLDOWN_SEC
-                    }
-                    logger.info(f"[{ticker}] Re-entry watch enabled (cooldown {TREND_REENTRY_COOLDOWN_SEC}s).")
-                else:
-                    err_msg = sell_res.get('msg1', 'unknown') if sell_res else 'no response'
-                    logger.error(f"[{ticker}] ❌ Trend-break sell FAILED after 3 attempts: {err_msg}")
-                    send_alert(f"🚨 [{ticker}] 추세이탈 매도 실패! 수동 확인 필요.\n오류: {err_msg}", is_error=True)
-                    # 포지션 유지 - 다음 루프에서 재시도
-                    monitoring_targets[ticker] = {
-                        'target': 9999999,
+                        'target': current_price,
                         'status': 'bought',
                         'buys': holding_qty,
                         'exchange': exchange,
@@ -1846,64 +1807,151 @@ def job():
                         'ma20': ma20,
                         'ma5': ma5,
                         'ohlc': ohlc,
+                        'dca_buys_this_session': 0,
+                        'last_dca_attempt_at': None,
+                        'dca_reentry_interval_min': (
+                            DCA_LEVERAGED_REENTRY_INTERVAL_MIN if (market == 'US' and ticker in US_LEVERAGED_ETF_SYMBOLS)
+                            else DCA_REENTRY_INTERVAL_MIN
+                        )
+                    }
+                    continue  # 이미 보유 중인 종목은 리스크 관리만 수행
+
+                prepare_dca_wait_target(ticker, exchange, current_price, ma20, ma5, ohlc)
+                attempt_dca_buy(ticker, exchange, current_price, ma20, ma5, ohlc, eff_gap_down_threshold, num_active_targets)
+                continue  # DCA는 주기적 재평가 대상으로 전환
+        
+            # Case 1: Already Holding
+            if ticker in current_holdings:
+                # 보유 수량 조회
+                holding_qty = 0
+                holding_avg_price = 0
+                try:
+                    for h in balance.get('output1', []):
+                        if h.get('pdno') == ticker or h.get('ovrs_pdno') == ticker:
+                            holding_qty = int(safe_float(h.get('hldg_qty', h.get('ovrs_cblc_qty', '0'))))
+                            holding_avg_price = safe_float(h.get('pchs_avg_pric', h.get('avg_unpr3', 0)))
+                            break
+                except:
+                    pass
+
+                # 실제 보유 수량이 0이면 skip (current_holdings 필터를 통과했더라도 재확인)
+                if holding_qty <= 0:
+                    logger.info(f"[{ticker}] 보유 수량 0, 매도 스킵 (이미 매도된 종목)")
+                    continue
+
+                if not is_uptrend and not is_short_uptrend:
+                    logger.info(f"[{ticker}] Trend Broken (Price < 20MA and < 5MA). Selling {holding_qty} shares immediately.")
+                    sell_res = None
+                    for _attempt in range(3):
+                        if market == 'US':
+                            sell_res = kis.sell_market_order(ticker, holding_qty, exchange)
+                        else:
+                            sell_res = kis.sell_market_order(ticker, holding_qty)
+                        if sell_res and sell_res.get('rt_cd') == '0':
+                            break
+                        logger.warning(f"[{ticker}] Trend-break sell attempt {_attempt+1} failed: {sell_res}. Retrying...")
+                        time.sleep(2)
+
+                    if sell_res and sell_res.get('rt_cd') == '0':
+                        logger.info(f"[{ticker}] ✅ Trend-break sell success.")
+                        today_open = safe_float(ohlc[0]['open'])
+                        reentry_target = calculate_target_price(today_open, ohlc, K_VALUE)
+                        monitoring_targets[ticker] = {
+                            'target': reentry_target,
+                            'status': 'reentry_watch',
+                            'buys': 0,
+                            'exchange': exchange,
+                            'ma20': ma20,
+                            'ma5': ma5,
+                            'ohlc': ohlc,
+                            'last_reentry_check_at': None,
+                            'reentry_cooldown_sec': TREND_REENTRY_COOLDOWN_SEC
+                        }
+                        logger.info(f"[{ticker}] Re-entry watch enabled (cooldown {TREND_REENTRY_COOLDOWN_SEC}s).")
+                    else:
+                        err_msg = sell_res.get('msg1', 'unknown') if sell_res else 'no response'
+                        logger.error(f"[{ticker}] ❌ Trend-break sell FAILED after 3 attempts: {err_msg}")
+                        send_alert(f"🚨 [{ticker}] 추세이탈 매도 실패! 수동 확인 필요.\n오류: {err_msg}", is_error=True)
+                        # 포지션 유지 - 다음 루프에서 재시도
+                        monitoring_targets[ticker] = {
+                            'target': 9999999,
+                            'status': 'bought',
+                            'buys': holding_qty,
+                            'exchange': exchange,
+                            'buy_price': holding_avg_price if holding_avg_price > 0 else current_price,
+                            'highest_price': current_price,
+                            'ma20': ma20,
+                            'ma5': ma5,
+                            'ohlc': ohlc,
+                        }
+                    continue
+                else:
+                    logger.info(f"[{ticker}] Trend OK. Holding {holding_qty} shares.")
+                    # Mark as bought to prevent duplicate buy
+                    monitoring_targets[ticker] = {
+                        'target': 9999999, # Dummy target
+                        'status': 'bought',
+                        'buys': holding_qty,
+                        'exchange': exchange,
+                        'buy_price': holding_avg_price if holding_avg_price > 0 else current_price,
+                        'highest_price': current_price,
+                        # [v3.0] 추세붕괴 손절이 동작하려면 ma20/ohlc 가 모니터 데이터에 있어야 함
+                        'ma20': ma20,
+                        'ma5': ma5,
+                        'ohlc': ohlc,
+                    }
+                    continue
+
+            # Case 2: New Entry (Trend Analysis)
+            if not is_uptrend:
+                logger.info(f"[{ticker}] Bear Market (Price < 20MA). Skipping (will recheck mid-session).")
+                # MA20 하회 종목은 mid-session 재검토를 위해 downtrend_watch로 등록
+                if market == 'US':
+                    monitoring_targets[ticker] = {
+                        'target': 0,
+                        'status': 'downtrend_watch',
+                        'buys': 0,
+                        'exchange': exchange,
+                        'ma20': ma20,
+                        'ma5': ma5,
+                        'ohlc': ohlc,
+                        'last_recheck_at': None,
                     }
                 continue
-            else:
-                logger.info(f"[{ticker}] Trend OK. Holding {holding_qty} shares.")
-                # Mark as bought to prevent duplicate buy
-                monitoring_targets[ticker] = {
-                    'target': 9999999, # Dummy target
-                    'status': 'bought',
-                    'buys': holding_qty,
-                    'exchange': exchange,
-                    'buy_price': holding_avg_price if holding_avg_price > 0 else current_price,
-                    'highest_price': current_price,
-                    # [v3.0] 추세붕괴 손절이 동작하려면 ma20/ohlc 가 모니터 데이터에 있어야 함
-                    'ma20': ma20,
-                    'ma5': ma5,
-                    'ohlc': ohlc,
-                }
-                continue
 
-        # Case 2: New Entry (Trend Analysis)
-        if not is_uptrend:
-            logger.info(f"[{ticker}] Bear Market (Price < 20MA). Skipping (will recheck mid-session).")
-            # MA20 하회 종목은 mid-session 재검토를 위해 downtrend_watch로 등록
+             # B. Calculate Target Price (Volatility Breakout)
+            # 실제 오늘 시가(today_open): quote API에서 실시간 시가 조회, 없으면 ohlc 폴백
+            today_open = 0.0
             if market == 'US':
-                monitoring_targets[ticker] = {
-                    'target': 0,
-                    'status': 'downtrend_watch',
-                    'buys': 0,
-                    'exchange': exchange,
-                    'ma20': ma20,
-                    'ma5': ma5,
-                    'ohlc': ohlc,
-                    'last_recheck_at': None,
-                }
-            continue
-
-         # B. Calculate Target Price (Volatility Breakout)
-        # 실제 오늘 시가(today_open): quote API에서 실시간 시가 조회, 없으면 ohlc 폴백
-        today_open = 0.0
-        if market == 'US':
-            try:
-                _q = kis.get_quote(ticker, exchange)
-                today_open = safe_float(_q.get('open')) if _q else 0.0
-            except Exception:
-                pass
-        if today_open <= 0:
-            today_open = safe_float(ohlc[0]['open'])  # fallback: 전일 시가
-        target_price = calculate_target_price(today_open, ohlc, K_VALUE)
-        logger.info(f"[{ticker}] Bull Market! Target Price: {target_price} (Today Open: {today_open})")
+                try:
+                    _q = kis.get_quote(ticker, exchange)
+                    today_open = safe_float(_q.get('open')) if _q else 0.0
+                except Exception:
+                    pass
+            if today_open <= 0:
+                today_open = safe_float(ohlc[0]['open'])  # fallback: 전일 시가
+            target_price = calculate_target_price(today_open, ohlc, K_VALUE)
+            logger.info(f"[{ticker}] Bull Market! Target Price: {target_price} (Today Open: {today_open})")
         
-        monitoring_targets[ticker] = {
-            'target': target_price,
-            'status': 'monitoring',  # monitoring, bought
-            'buys': 0,
-            'exchange': exchange,
-            'ma20': ma20,
-            'ohlc': ohlc  # 신호 강도 계산용
-        }
+            monitoring_targets[ticker] = {
+                'target': target_price,
+                'status': 'monitoring',  # monitoring, bought
+                'buys': 0,
+                'exchange': exchange,
+                'ma20': ma20,
+                'ohlc': ohlc  # 신호 강도 계산용
+            }
+        except Exception as _tick_e:
+            # [v5.1] 종목 하나에서 발생한 예외가 전체 세션을 죽이지 않도록 격리한다.
+            # 이전에는 try/except 가 없어 한 종목의 API 응답 파싱 오류만으로도
+            # 전체 세션(KR/US 하루 1회 재시도 창)이 끊겼다.
+            _tname = (t_obj.get('symbol') or t_obj.get('code')) if isinstance(t_obj, dict) else t_obj
+            logger.error(f"[{_tname}] 종목 처리 중 예외 발생 (이 종목만 건너뛰고 세션 계속): {_tick_e}", exc_info=True)
+            send_alert(
+                f"⚠️ [{_tname}] 종목 처리 중 예외가 발생해 이 종목만 건너뛰었습니다 (세션은 계속 진행).\n오류: {_tick_e}",
+                is_error=True
+            )
+            continue
 
     if not monitoring_targets:
         logger.info(f"[{market}] No targets found for today. Sleeping.")
@@ -2557,7 +2605,16 @@ def job():
 
             if data['status'] in ['failed', 'sold_sl', 'sold_tp', 'sl_failed', 'tp_failed']:
                 continue
-                
+
+            # [v5.1] DCA/공격적 DCA는 신규 매수를 전용 게이트 파이프라인(Step 1,
+            # 세션 시작 시 aggressive_dca 블록)에서만 결정한다. 그 아래의 레거시
+            # VBO 브레이크아웃 매수 코드는 day/swing 전략 전용이며, 여기로 새어
+            # 들어오면 추세/AI/섹터/상관관계 게이트를 전부 우회해 매수해버린다
+            # ('blocked'·'dca_wait' 상태 종목이 target=차단 시점 가격이라 아주
+            # 작은 반등에도 "브레이크아웃"으로 오인되는 게이트 우회 버그였음).
+            if STRATEGY_MODE in ('dca', 'aggressive_dca'):
+                continue
+
             target_price = data['target']
             exchange = data.get('exchange')
             
@@ -2735,54 +2792,92 @@ def run_with_recovery():
     """Wrapper function to run job with automatic recovery.
     Uses KST timezone for all time comparisons.
     Uses range-based triggers with daily flags to prevent duplicate execution.
+
+    [v5.1] job() 크래시 시 "그날은 포기"가 아니라 같은 세션(장중) 안에서 백오프
+    재시도한다. 과거 US 세션이 시작 직후 크래시하면 다음날 23:30 창까지 몇 주간
+    조용히 거래가 끊기는 사고가 반복됐다(AGENTS.md 기록: 2026-05-26, 2026-06-24,
+    2026-07). 재시도도 max_consecutive_errors 회로 명확히 bound 되며, 그마저
+    소진되면 "오늘은 포기"를 알림으로 명확히 남긴다 (조용히 삼키지 않음).
     """
     max_consecutive_errors = 5
-    error_count = 0
+    kr_error_count = 0
+    us_error_count = 0
     kr_triggered_today = False
     us_triggered_today = False
+    kr_session_done_today = False  # 정상 종료(장마감) 또는 재시도 소진 → 오늘은 더 안 건드림
+    us_session_done_today = False
+    kr_retry_at = None
+    us_retry_at = None
     opro_triggered_today = False  # 장 마감 후 백테스트+OPRO 자동 실행
     last_date = None
-    
+
+    def _backoff_seconds(n):
+        return min(300, 30 * n)
+
+    def _run_session(market_label, ctx_now):
+        """job()을 실행하고 (성공여부, 예외) 반환. 알림/로그는 호출부에서 처리."""
+        try:
+            job()
+            return True, None
+        except Exception as e:
+            logger.critical(f"{market_label} Job Crashed: {e}", exc_info=True)
+            return False, e
+
     # --- Startup Check (runs once at boot) ---
     kst = pytz.timezone('Asia/Seoul')
     now_kst = datetime.datetime.now(kst)
     ctx = get_market_status()
     last_date = now_kst.strftime("%Y%m%d")
-    
+
     if ctx != 'CLOSED':
         logger.info(f"⚡ Bot started during {ctx} Trading Hours (KST: {now_kst.strftime('%H:%M:%S')}). Launching job immediately.")
-        try:
-            job()
-            error_count = 0
-            # Mark as triggered to prevent duplicate execution
+        ok, err = _run_session(ctx, now_kst)
+        if ctx == 'KR':
+            kr_triggered_today = True
+        elif ctx == 'US':
+            us_triggered_today = True
+        if ok:
             if ctx == 'KR':
-                kr_triggered_today = True
+                kr_session_done_today = True
             elif ctx == 'US':
-                us_triggered_today = True
-        except Exception as e:
-            logger.critical(f"Startup Job Crashed: {e}", exc_info=True)
-            send_alert(f"Startup Job Crashed: {e}", is_error=True)
+                us_session_done_today = True
+        else:
+            send_alert(f"Startup Job Crashed: {err}", is_error=True)
+            backoff = _backoff_seconds(1)
+            retry_at = datetime.datetime.now(kst) + datetime.timedelta(seconds=backoff)
+            if ctx == 'KR':
+                kr_error_count = 1
+                kr_retry_at = retry_at
+            elif ctx == 'US':
+                us_error_count = 1
+                us_retry_at = retry_at
     else:
         logger.info(f"😴 Bot started during CLOSED hours (KST: {now_kst.strftime('%H:%M:%S')}). Waiting for market open...")
-    
+
     # --- Main Loop ---
     while True:
         try:
             schedule.run_pending()
-            
+
             kst = pytz.timezone('Asia/Seoul')
             now = datetime.datetime.now(kst)
             t = int(now.strftime("%H%M"))
             today_str = now.strftime("%Y%m%d")
-            
+
             # Reset daily triggers at date change
             if last_date != today_str:
                 kr_triggered_today = False
                 us_triggered_today = False
+                kr_session_done_today = False
+                us_session_done_today = False
+                kr_retry_at = None
+                us_retry_at = None
+                kr_error_count = 0
+                us_error_count = 0
                 opro_triggered_today = False
                 last_date = today_str
                 logger.info(f"📅 New day: {today_str} (KST). Daily triggers reset.")
-            
+
             # KR 장 마감 후 16:00 KST — 백테스트 + OPRO 자동 최적화
             if 1600 <= t <= 1605 and not opro_triggered_today:
                 opro_triggered_today = True
@@ -2814,42 +2909,82 @@ def run_with_recovery():
                     logger.error(f"[OPRO] 자동 최적화 실패: {_opro_e}", exc_info=True)
                     send_alert(f"⚠️ OPRO 자동 최적화 실패: {_opro_e}", is_error=True)
 
-            # KR Market: Trigger between 09:00~09:05 KST (5-minute window)
-            if 900 <= t <= 905 and not kr_triggered_today:
+            # KR Market: 09:00~09:05 정규 트리거 창 + 크래시 시 백오프 재시도(같은 세션)
+            kr_market_open_now = (get_market_status() == 'KR')
+            kr_should_start = False
+            if kr_market_open_now and not kr_session_done_today:
+                if not kr_triggered_today and 900 <= t <= 905:
+                    kr_should_start = True
+                elif kr_triggered_today and kr_retry_at and now >= kr_retry_at:
+                    kr_should_start = True
+
+            if kr_should_start:
                 kr_triggered_today = True
+                kr_retry_at = None
                 logger.info(f"⏰ KR Market trigger at KST {now.strftime('%Y-%m-%d %H:%M:%S')}")
-                try:
-                    job()
-                    error_count = 0
-                except Exception as e:
-                    error_count += 1
-                    logger.critical(f"KR Job Crashed (Attempt {error_count}/{max_consecutive_errors}): {e}", exc_info=True)
-                    send_alert(f"KR Job Crashed: {e}", is_error=True)
-                    if error_count >= max_consecutive_errors:
-                        logger.critical("Too many consecutive errors. Waiting 5 minutes before retry...")
-                        send_alert("Too many consecutive KR errors! Waiting 5 minutes...", is_error=True)
-                        time.sleep(300)
-                        error_count = 0
-                time.sleep(60)
-                
-            # US Market: Trigger between 23:30~23:35 KST (5-minute window)
-            if 2330 <= t <= 2335 and not us_triggered_today:
+                ok, err = _run_session('KR', now)
+                if ok:
+                    kr_error_count = 0
+                    kr_session_done_today = True  # 정상 종료(장마감) — 오늘은 재시도 불필요
+                else:
+                    kr_error_count += 1
+                    if kr_error_count >= max_consecutive_errors:
+                        logger.critical("KR 세션이 반복적으로 크래시하여 오늘은 재시도를 중단합니다.")
+                        send_alert(
+                            f"🚨 [KR] 세션이 {kr_error_count}회 연속 크래시하여 오늘은 재시도를 중단합니다. "
+                            f"수동 확인이 필요합니다.\n마지막 오류: {err}",
+                            is_error=True
+                        )
+                        kr_session_done_today = True
+                        kr_error_count = 0
+                    else:
+                        backoff = _backoff_seconds(kr_error_count)
+                        kr_retry_at = datetime.datetime.now(kst) + datetime.timedelta(seconds=backoff)
+                        send_alert(
+                            f"⚠️ [KR] 세션 크래시 ({kr_error_count}/{max_consecutive_errors}). "
+                            f"{backoff}초 후 같은 세션 내 재시도합니다.\n오류: {err}",
+                            is_error=True
+                        )
+                time.sleep(1)
+
+            # US Market: 23:30~23:35 정규 트리거 창 + 크래시 시 백오프 재시도(같은 세션)
+            us_market_open_now = (get_market_status() == 'US')
+            us_should_start = False
+            if us_market_open_now and not us_session_done_today:
+                if not us_triggered_today and 2330 <= t <= 2335:
+                    us_should_start = True
+                elif us_triggered_today and us_retry_at and now >= us_retry_at:
+                    us_should_start = True
+
+            if us_should_start:
                 us_triggered_today = True
+                us_retry_at = None
                 logger.info(f"⏰ US Market trigger at KST {now.strftime('%Y-%m-%d %H:%M:%S')}")
-                try:
-                    job()
-                    error_count = 0
-                except Exception as e:
-                    error_count += 1
-                    logger.critical(f"US Job Crashed (Attempt {error_count}/{max_consecutive_errors}): {e}", exc_info=True)
-                    send_alert(f"US Job Crashed: {e}", is_error=True)
-                    if error_count >= max_consecutive_errors:
-                        logger.critical("Too many consecutive errors. Waiting 5 minutes before retry...")
-                        send_alert("Too many consecutive US errors! Waiting 5 minutes...", is_error=True)
-                        time.sleep(300)
-                        error_count = 0
-                time.sleep(60)
-                
+                ok, err = _run_session('US', now)
+                if ok:
+                    us_error_count = 0
+                    us_session_done_today = True
+                else:
+                    us_error_count += 1
+                    if us_error_count >= max_consecutive_errors:
+                        logger.critical("US 세션이 반복적으로 크래시하여 오늘은 재시도를 중단합니다.")
+                        send_alert(
+                            f"🚨 [US] 세션이 {us_error_count}회 연속 크래시하여 오늘은 재시도를 중단합니다. "
+                            f"수동 확인이 필요합니다.\n마지막 오류: {err}",
+                            is_error=True
+                        )
+                        us_session_done_today = True
+                        us_error_count = 0
+                    else:
+                        backoff = _backoff_seconds(us_error_count)
+                        us_retry_at = datetime.datetime.now(kst) + datetime.timedelta(seconds=backoff)
+                        send_alert(
+                            f"⚠️ [US] 세션 크래시 ({us_error_count}/{max_consecutive_errors}). "
+                            f"{backoff}초 후 같은 세션 내 재시도합니다.\n오류: {err}",
+                            is_error=True
+                        )
+                time.sleep(1)
+
             time.sleep(1)
             
         except KeyboardInterrupt:
